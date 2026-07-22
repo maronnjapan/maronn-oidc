@@ -1,0 +1,281 @@
+# リリース手順
+
+このリポジトリの npm publish は **Changesets + GitHub Actions（`.github/workflows/release.yml`）** で自動化されている。
+publish は **npm Trusted Publishing (OIDC)** を利用し、長期トークン（`NPM_TOKEN`）を一切持たない構成。
+
+対象パッケージ:
+
+- `@maronn-oidc/core`
+- `@maronn-oidc/cli`
+
+通常のリリース運用（changeset を貯めて Version Packages PR をマージすると publish される二段階フロー）は
+`release.yml` 冒頭のコメントを参照。本ドキュメントは **publish を成立させるための初期セットアップ**を扱う。
+
+---
+
+## 全体像
+
+npm の Trusted Publisher は「**そのパッケージが npm 上に既に存在していること**」を前提に設定する。
+そのため publish は以下の順序になる。
+
+1. **初回だけ**: ローカルから手動で publish して、パッケージを npm 上に作成する（→ [初回 publish](#初回-publish手動ブートストラップ)）
+2. **npm 側で Trusted Publisher を設定する**（→ [Trusted Publisher の設定](#trusted-publisher-の設定次回以降のためのnpm側設定)）
+3. **2回目以降**: GitHub Actions の OIDC publish だけで完結する（手動作業不要）
+
+> organization 単位の Trusted Publisher を使える場合は 1 を省略できることがあるが、
+> 確実なのはパッケージ単位設定なので、本手順では初回手動 publish を前提にする。
+
+---
+
+## 初回 publish（手動ブートストラップ）
+
+各パッケージの **最初の 1 回だけ** ローカルから実行する。
+
+### 前提
+
+- npm アカウントが `@maronn-oidc` スコープ（organization）に publish 権限を持っていること
+- 2FA を有効にしている場合は publish 時に OTP を求められる
+- ローカルの Node / pnpm がリポジトリ指定バージョンであること（`pnpm@10.17.0`）
+
+### 手順
+
+```bash
+# 1. npm にログイン（ブラウザ認証 or トークン）
+npm login
+
+# 2. 公開状態とバージョンを確認（private:true でないこと、access:public であること）
+cat packages/core/package.json   # publishConfig.access = "public" を確認
+cat packages/cli/package.json
+
+# 3. クリーンな状態でビルド
+pnpm install --frozen-lockfile
+pnpm run build
+
+# 4. 各パッケージを publish（スコープ付きなので public 指定が必須）
+pnpm --filter @maronn-oidc/core publish --access public --no-git-checks
+pnpm --filter @maronn-oidc/cli  publish --access public --no-git-checks
+```
+
+> `--no-git-checks` は「コミットされていない変更があると pnpm publish が止まる」挙動を回避するためのもの。
+> ブートストラップ時のみ利用し、通常リリースは CI に任せるので普段は使わない。
+
+publish 後、npmjs.com に各パッケージのページが作成されていることを確認する。
+
+- https://www.npmjs.com/package/@maronn-oidc/core
+- https://www.npmjs.com/package/@maronn-oidc/cli
+
+> 初回手動 publish では provenance（来歴証明）は付かない。provenance は CI の OIDC publish で自動付与される。
+
+---
+
+## Trusted Publisher の設定（次回以降のための npm 側設定）
+
+初回 publish でパッケージが存在する状態になったら、各パッケージに GitHub Actions を信頼させる。
+**この設定をすると以降 `NPM_TOKEN` 不要で、CI から短命トークンで安全に publish できる。**
+
+### 手順（パッケージごとに実施）
+
+1. npmjs.com にログインし、対象パッケージページを開く
+   - `@maronn-oidc/core`
+   - `@maronn-oidc/cli`
+2. **Settings** タブ → **Trusted Publisher**（Publishing access）セクションへ
+3. **GitHub Actions** を選び、以下を登録する
+
+   | 項目 | 値 |
+   |---|---|
+   | Provider | GitHub Actions |
+   | Organization / user | `maronnjapan` |
+   | Repository | `maronn-oidc` |
+   | Workflow filename | `release.yml` |
+   | Environment | （未使用なので空欄） |
+
+4. 保存する。両パッケージとも同じ内容で登録する。
+
+> Workflow filename は **パスではなくファイル名のみ**（`release.yml`）。
+> リポジトリ内の `.github/workflows/release.yml` と一致している必要がある。
+
+### 補足: なぜトークンが要らないのか
+
+- `release.yml` は `permissions.id-token: write` を付与しており、GitHub が発行する OIDC トークンを取得できる。
+- npm 側の Trusted Publisher 設定と OIDC トークンの `repository` / `workflow` が一致すると、npm が短命の publish トークンを発行する。
+- pnpm 10.17+ がこの OIDC trusted publishing に対応しているため、`changeset publish`（実体は pnpm publish）がそのまま通る。
+
+---
+
+## 2回目以降の通常リリース（参考）
+
+ここまで設定すれば、以降は手動 publish は不要。
+
+1. 機能 PR で `pnpm changeset` を実行し `.changeset/*.md` をコミットして main にマージ
+2. Changesets が「Version Packages」PR を自動作成・更新（バージョンと CHANGELOG を集約）
+3. リリースしたいタイミングでその PR をマージ → main への push で CI が npm へ publish
+
+詳細は `.github/workflows/release.yml` の冒頭コメントを参照。
+
+### provenance の自動検証と手動確認
+
+`release.yml` は publish が発生したとき、Changesets の `publishedPackages` に含まれる
+正確な `name@version` を一時ディレクトリへインストールし、`npm audit signatures --json
+--include-attestations` を実行する。署名検証に加えて、対象の各 `name@version` に
+SLSA provenance v1 attestation が存在することを明示的に検査するため、registry signature
+だけが有効で provenance が欠落している場合も release job は失敗する。
+
+リリース担当者は job の成功に加え、npm の各バージョンページに provenance の緑色チェックが
+表示され、次の4項目が意図した GitHub Actions 実行と一致することを確認する。
+
+1. Build Environment
+2. Build Summary（`release.yml` の該当 run）
+3. Source Commit（リリース対象 commit）
+4. Build File（`.github/workflows/release.yml`）
+
+2026-07-21 時点では両パッケージを npm registry で照会すると `E404` であり、公開済み
+version の provenance はまだ確認できない。初回 publish は手動ブートストラップのため
+provenance が付かず、Trusted Publisher を設定した次の CI publish から上記の自動検証を必須とする。
+
+---
+
+## トラブルシューティング
+
+| 症状 | 原因 / 対処 |
+|---|---|
+| CI publish が `404` / `403` で失敗 | パッケージ未作成、または Trusted Publisher 未設定。初回手動 publish と npm 側設定を確認 |
+| `Workflow does not match` 系エラー | npm の Trusted Publisher の Workflow filename が `release.yml` と一致しているか確認 |
+| publish 後の `Verify published package provenance` が失敗 | npm の version ページで provenance を確認し、Trusted Publisher の repository/workflow 設定、`id-token: write`、公開リポジトリであることを確認 |
+| `npm publish` がローカルで `private` を理由に止まる | ルート以外の対象パッケージで `private: true` になっていないか確認（公開対象は `core` / `cli`） |
+| スコープ付きで `402 Payment Required` | `--access public` 指定漏れ。`publishConfig.access: "public"` も併せて確認 |
+
+---
+
+## トラブルシュート詳細ログ（初回セットアップ時の実録）
+
+上表は要点のみのため、実際に踏んだエラーの詳細と根本原因を時系列で残す。
+将来同種の問題が再発した場合の一次情報として、また将来的なブログ化のために記録する。
+
+### 1. PR作成で403エラー
+
+```
+Error: GitHub Actions is not permitted to create or approve pull requests.
+```
+
+**要因:**
+`permissions: pull-requests: write` をワークフローに設定していても、リポジトリ側の
+「GitHub Actions が PR を作成・承認することを許可する」設定がデフォルト OFF のため。
+ワークフロー内権限とは別レイヤーのガードになっている。
+
+**対処:**
+Settings → Actions → General → Workflow permissions →
+「Allow GitHub Actions to create and approve pull requests」にチェック
+
+**参考:**
+- https://docs.github.com/rest/pulls/pulls#create-a-pull-request
+
+### 2. npm publishで404エラー（1回目・根本原因）
+
+```
+Error: 404 Not Found - PUT https://registry.npmjs.org/@scope/pkg
+```
+
+**要因:**
+GitHub Actions の Node 22 にバンドルされる npm は v10 系で、
+npm trusted publishing（OIDC）の要求バージョン（npm >= 11.5.1）を満たさない。
+OIDC ハンドシェイクが失敗すると匿名ユーザー扱いになり、認証エラーではなく紛らわしい 404 が返る。
+
+**対処:**
+`npm install -g npm@latest`（または具体バージョンにピン留め）のステップを
+`setup-node` の直後、`pnpm install` の前に追加する。
+
+**参考:**
+- https://github.com/npm/cli/issues/8730
+- https://github.com/npm/cli/issues/8976
+- https://github.com/npm/cli/issues/8678
+- https://medium.com/@kenricktan11/npm-trusted-publishers-the-weird-404-error-and-the-node-js-24-fix-a9f1d717a5dd
+- https://docs.npmjs.com/trusted-publishers/
+
+### 3. ERR_PNPM_IGNORED_BUILDS
+
+```
+Ignored build scripts: esbuild@0.21.5, esbuild@0.25.12, esbuild@0.27.7, sharp@0.34.5
+```
+
+**要因:**
+pnpm 10 以降、依存パッケージの postinstall 等の build script を
+サプライチェーン攻撃対策としてデフォルトで自動実行しなくなった。
+ローカルで `pnpm approve-builds` を実行した結果（`package.json` / `pnpm-workspace.yaml` への書き込み）が
+コミット・push されておらず、CI 上のチェックアウトには反映されていなかった。
+
+**対処:**
+ローカルで `pnpm approve-builds` → 生成された設定を確認してコミットする
+（pnpm 10 系では `package.json` の `pnpm.onlyBuiltDependencies` に反映される）。
+pnpm バージョン（`packageManager` フィールド）がローカル / CI で一致しているかも合わせて確認する。
+
+**参考:**
+- https://pnpm.io/settings
+- https://github.com/pnpm/pnpm/issues/9082（`shared-workspace-lockfile=false` 時の既知の非適用問題）
+- https://pnpm.io/blog/releases/11.0（v11 で `onlyBuiltDependencies` → `allowBuilds` へ変更、参考として）
+
+### 4. npm publishで404エラー（2回目・pnpm 11回帰バグ）
+
+```
+Error: 404 Not Found（pnpm 11環境下でのOIDC publish）
+```
+
+**要因:**
+pnpm 11 で publish コマンドが npm CLI 委譲からネイティブ実装に変更され、
+それに伴い OIDC trusted publishing が v10 時代と同じに動かず 404 になる既知の回帰バグ。
+
+**対処:**
+`packageManager` フィールドを動作実績のある pnpm@10.17.0 系に固定し直す。
+
+**参考:**
+- https://github.com/pnpm/pnpm/issues/11513
+- https://pnpm.io/blog/releases/11.3（ネイティブ publish 移行の経緯）
+
+### 5. Cannot find module 'sigstore'
+
+```
+error an error occurred while publishing @maronn-oidc/cli:
+MODULE_NOT_FOUND Cannot find module 'sigstore'
+```
+
+**要因:**
+`npm install -g npm@latest` が、`latest` dist タグの解決タイミングによって
+意図せずプレリリース版（12.0.0-pre.2 系）を掴んでしまい、
+そのビルドで `libnpmpublish` が依存する `sigstore` モジュール解決が壊れていた。
+npm/cli 側の直近の未修正バグ（2026年7月頭に報告）。
+
+**対処:**
+`npm@latest` ではなく、正式タグ付けされた安定版を明示的にバージョンピン留めする
+（今回は `npm@11.17.0` を指定して解消）。
+
+**参考:**
+- https://github.com/npm/cli/issues/9722
+- https://github.com/npm/cli/releases（正式リリースタグの確認）
+
+### 最終的な release.yml の該当部分（要点）
+
+```yaml
+- name: Setup Node.js
+  uses: actions/setup-node@v4
+  with:
+    node-version: '22'
+    cache: 'pnpm'
+    registry-url: 'https://registry.npmjs.org'
+- name: Update npm to a pinned stable version
+  run: npm install -g npm@11.17.0   # latestではなく明示バージョン指定
+- name: Install dependencies
+  run: pnpm install --frozen-lockfile
+```
+
+```jsonc
+// package.json
+{
+  "packageManager": "pnpm@10.17.0", // pnpm11の回帰バグを回避
+  "pnpm": {
+    "onlyBuiltDependencies": ["esbuild", "sharp"] // 承認結果をコミット
+  }
+}
+```
+
+リポジトリ設定:
+Settings → Actions → General → Workflow permissions →
+「Allow GitHub Actions to create and approve pull requests」ON

@@ -1,0 +1,18 @@
+version: 2
+updates:
+  - package-ecosystem: npm
+    directories:
+      - "/"
+      - "/packages/*"
+      - "/samples/*"
+      - "/tests/*"
+    schedule:
+      interval: weekly
+    groups:
+      monorepo-dependencies:
+        group-by: dependency-name
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly

@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+
+jobs:
+
+  dependency-audit:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Enable Corepack
+        run: corepack enable
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Audit high-severity vulnerabilities
+        run: pnpm audit --audit-level=high
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Enable Corepack
+        run: corepack enable
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # TODO: Lintと型チェックを適用後、有効化する。
+      # - name: Type check
+      #   run: pnpm run typecheck
+
+      # - name: Lint
+      #   run: pnpm run lint
+
+      - name: Unit & Integration tests
+        run: pnpm run test:ci
+
+      - name: Install Playwright browsers
+        run: pnpm --filter @maronn-oidc/e2e exec playwright install --with-deps chromium
+
+      - name: E2E tests
+        run: pnpm run test:e2e
+
+      - name: Upload E2E reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: oidc-e2e-reports
+          path: |
+            tests/e2e/playwright-report
+            tests/e2e/test-results
+          if-no-files-found: ignore

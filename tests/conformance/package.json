@@ -1,0 +1,13 @@
+{
+  "name": "@maronn-oidc/conformance",
+  "version": "0.0.1",
+  "private": true,
+  "description": "OpenID Foundation conformance suite runner for sample OpenID Providers",
+  "type": "module",
+  "scripts": {
+    "test": "node --test scripts/*.test.mjs",
+    "typecheck": "node --check scripts/*.mjs",
+    "generate": "node scripts/create-basic-op-config.mjs",
+    "basic-op": "bash scripts/run-basic-op.sh"
+  }
+}

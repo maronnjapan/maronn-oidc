@@ -1,0 +1,53 @@
+{
+  "name": "@maronn-oidc/cli",
+  "version": "0.1.1",
+  "description": "CLI tool to generate OpenID Connect Provider code",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "bin": {
+    "maronn-oidc": "./dist/index.js"
+  },
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "files": [
+    "dist",
+    "LICENSE",
+    "README.md"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run",
+    "test:ci": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit"
+  },
+  "keywords": [
+    "openid-connect",
+    "oauth2.1",
+    "cli",
+    "code-generator"
+  ],
+  "author": "maronnjapan",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/maronnjapan/maronn-oidc.git",
+    "directory": "packages/cli"
+  },
+  "bugs": {
+    "url": "https://github.com/maronnjapan/maronn-oidc/issues"
+  },
+  "homepage": "https://github.com/maronnjapan/maronn-oidc/tree/main/packages/cli#readme",
+  "devDependencies": {
+    "typescript": "^5.7.2",
+    "vitest": "^3.2.6"
+  }
+}

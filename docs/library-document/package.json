@@ -1,0 +1,14 @@
+{
+  "name": "@maronn-oidc/docs",
+  "version": "0.0.1",
+  "private": true,
+  "scripts": {
+    "dev:doc": "astro dev",
+    "build:doc": "astro build",
+    "preview:doc": "astro preview"
+  },
+  "dependencies": {
+    "@astrojs/starlight": "^0.39.2",
+    "astro": "^6.4.6"
+  }
+}

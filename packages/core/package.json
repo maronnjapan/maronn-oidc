@@ -1,0 +1,51 @@
+{
+  "name": "@maronn-oidc/core",
+  "version": "0.0.1",
+  "description": "OpenID Connect Provider core implementation",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "files": [
+    "dist",
+    "LICENSE",
+    "README.md"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run",
+    "test:ci": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest --coverage"
+  },
+  "keywords": [
+    "openid-connect",
+    "oauth2.1",
+    "authentication"
+  ],
+  "author": "maronnjapan",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/maronnjapan/maronn-oidc.git",
+    "directory": "packages/core"
+  },
+  "bugs": {
+    "url": "https://github.com/maronnjapan/maronn-oidc/issues"
+  },
+  "homepage": "https://github.com/maronnjapan/maronn-oidc/tree/main/packages/core#readme",
+  "devDependencies": {
+    "@edge-runtime/vm": "^5.0.0",
+    "@types/node": "^25.2.2",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  }
+}

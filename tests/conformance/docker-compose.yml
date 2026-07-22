@@ -1,0 +1,88 @@
+services:
+  mongodb:
+    image: mongo:6.0.13
+    volumes:
+      - conformance-mongodb:/data/db
+
+  conformance-server:
+    image: registry.gitlab.com/openid/conformance-suite:${CONFORMANCE_SUITE_IMAGE_TAG:-latest}
+    environment:
+      BASE_URL: ${CONFORMANCE_SUITE_BASE_URL:-https://conformance-nginx:8443}
+      MONGODB_HOST: mongodb
+      SPRING_PROFILES_ACTIVE: dev
+      OIDC_GOOGLE_CLIENTID: google-client
+      OIDC_GOOGLE_SECRET: google-secret
+      OIDC_GITLAB_CLIENTID: gitlab-client
+      OIDC_GITLAB_SECRET: gitlab-secret
+    depends_on:
+      - mongodb
+    networks:
+      default:
+        aliases:
+          - server
+
+  conformance-nginx:
+    image: registry.gitlab.com/openid/conformance-suite/nginx:${CONFORMANCE_SUITE_IMAGE_TAG:-latest}
+    ports:
+      - "${CONFORMANCE_SUITE_PORT:-8443}:8443"
+    depends_on:
+      - conformance-server
+    networks:
+      default:
+        aliases:
+          - nginx
+
+  op:
+    image: node:22-bookworm-slim
+    working_dir: /workspace
+    command:
+      - sh
+      - -lc
+      - ${CONFORMANCE_SAMPLE_START_COMMAND:-node samples/hono/dist/server.js}
+    volumes:
+      - ../..:/workspace:ro
+    environment:
+      HOST: 0.0.0.0
+      PORT: 3010
+      ISSUER: ${CONFORMANCE_OP_ISSUER:-https://op-tls:3443}
+      OIDC_CLIENTS_JSON: ${OIDC_CLIENTS_JSON:?OIDC_CLIENTS_JSON must be generated before running compose}
+      OIDC_ALLOW_NON_PKCE_AUTHORIZATION_CODE_FLOW: ${OIDC_ALLOW_NON_PKCE_AUTHORIZATION_CODE_FLOW:-0}
+      OIDC_ALLOW_UNSIGNED_REQUEST_OBJECT: ${OIDC_ALLOW_UNSIGNED_REQUEST_OBJECT:-0}
+
+  op-tls:
+    image: nginx:1.27-alpine
+    ports:
+      - "${CONFORMANCE_OP_TLS_PORT:-3443}:3443"
+    volumes:
+      - ./.generated/nginx/op-tls.conf:/etc/nginx/nginx.conf:ro
+      - ./.generated/certs:/etc/nginx/certs:ro
+    depends_on:
+      - op
+    networks:
+      default:
+        aliases:
+          - op-tls
+
+  runner:
+    build:
+      context: .
+      dockerfile: runner.Dockerfile
+    working_dir: /workspace
+    volumes:
+      - ../..:/workspace
+    environment:
+      CONFORMANCE_SERVER: ${CONFORMANCE_SERVER:-https://conformance-nginx:8443/}
+      CONFORMANCE_SERVER_MTLS: ${CONFORMANCE_SERVER_MTLS:-https://conformance-nginx:8443/}
+      CONFORMANCE_DEV_MODE: "1"
+      DISABLE_SSL_VERIFY: "1"
+      CONFORMANCE_SUITE_REF: ${CONFORMANCE_SUITE_REF:-master}
+      CONFORMANCE_CONFIG_PATH: ${CONFORMANCE_CONFIG_PATH:-/workspace/tests/conformance/.generated/basic-op-config.json}
+      CONFORMANCE_RESULTS_DIR: ${CONFORMANCE_RESULTS_DIR:-/workspace/tests/conformance/results}
+      CONFORMANCE_RESTART_RETRIES: ${CONFORMANCE_RESTART_RETRIES:-2}
+      CONFORMANCE_TEST_PLAN: ${CONFORMANCE_TEST_PLAN:-oidcc-basic-certification-test-plan[server_metadata=discovery][client_registration=static_client]}
+    depends_on:
+      - conformance-nginx
+      - op-tls
+
+volumes:
+  conformance-mongodb:

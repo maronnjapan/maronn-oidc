@@ -1,0 +1,65 @@
+name: OpenID Conformance
+
+on:
+  workflow_dispatch:
+    inputs:
+      sample_app:
+        description: "Sample OP app to test"
+        required: false
+        default: "hono"
+        type: choice
+        options:
+          - hono
+          - express
+          - fastify
+          - nextjs
+      suite_image_tag:
+        description: "OpenID conformance suite Docker image tag"
+        required: false
+        default: "latest"
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, labeled]
+    paths:
+      - "packages/**"
+      - "samples/**"
+      - "tests/conformance/**"
+      - ".github/workflows/conformance.yml"
+      - "package.json"
+      - "pnpm-lock.yaml"
+
+jobs:
+  basic-op:
+    if: github.event_name == 'workflow_dispatch' || contains(join(github.event.pull_request.labels.*.name, ','), 'run-conformance')
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Enable Corepack
+        run: corepack enable
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "pnpm"
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run Basic OP conformance suite
+        env:
+          CONFORMANCE_SAMPLE_APP: ${{ github.event.inputs.sample_app || 'hono' }}
+          CONFORMANCE_SUITE_IMAGE_TAG: ${{ github.event.inputs.suite_image_tag || 'latest' }}
+        run: pnpm run conformance:basic-op
+
+      - name: Upload conformance artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: oidf-basic-op-conformance
+          path: |
+            tests/conformance/results
+            tests/conformance/.generated
+          if-no-files-found: ignore

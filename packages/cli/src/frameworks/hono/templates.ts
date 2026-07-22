@@ -1,0 +1,5400 @@
+/**
+ * Hono framework templates for OpenID Connect Provider
+ */
+
+import { DEFAULT_FEATURES } from '../../features.js';
+import type { OidcFeatureConfig } from '../../features.js';
+
+function oidcMethodGuardTemplate(features: OidcFeatureConfig): string {
+  const introspectionMethod = features.introspection
+    ? `  '/introspect': ['POST'],\n`
+    : '';
+  const revocationMethod = features.revocation
+    ? `  '/revoke': ['POST'],\n`
+    : '';
+  return `const OIDC_ENDPOINT_METHODS: Readonly<Record<string, readonly string[]>> = {
+  '/authorize': ['GET', 'POST'],
+  '/token': ['POST'],
+  '/userinfo': ['GET', 'POST'],
+${introspectionMethod}${revocationMethod}  '/.well-known/jwks.json': ['GET'],
+  '/.well-known/openid-configuration': ['GET'],
+  '/login': ['GET', 'POST'],
+  '/consent': ['GET', 'POST'],
+};
+
+async function enforceOidcEndpointMethod(c: any, next: () => Promise<void>): Promise<Response | void> {
+  const pathname = new URL(c.req.url).pathname;
+  const allowed = OIDC_ENDPOINT_METHODS[pathname];
+  if (allowed && !allowed.includes(c.req.method)) {
+    c.header('Allow', allowed.join(', '));
+    return c.body(null, 405);
+  }
+  await next();
+}
+`;
+}
+
+export function appTemplate(
+  _corePkg: string,
+  features: OidcFeatureConfig = DEFAULT_FEATURES,
+): string {
+  const introspectionImport = features.introspection
+    ? `import { introspectionApp } from './routes/introspection.js';\n`
+    : '';
+  const revocationImport = features.revocation
+    ? `import { revocationApp } from './routes/revocation.js';\n`
+    : '';
+  const introspectionCors = features.introspection
+    ? `  app.use('/introspect', protectedCors);\n`
+    : '';
+  const revocationCors = features.revocation
+    ? `  app.use('/revoke', protectedCors);\n`
+    : '';
+  const introspectionMount = features.introspection
+    ? `  app.route('/introspect', introspectionApp);\n`
+    : '';
+  const revocationMount = features.revocation
+    ? `  app.route('/revoke', revocationApp);\n`
+    : '';
+  const methodGuard = oidcMethodGuardTemplate(features);
+  return `import { Hono } from 'hono';
+import { cors } from 'hono/cors';
+import { authorizeApp } from './routes/authorize.js';
+import { tokenApp } from './routes/token.js';
+import { userinfoApp } from './routes/userinfo.js';
+${introspectionImport}${revocationImport}import { jwksApp } from './routes/jwks.js';
+import { discoveryApp } from './routes/discovery.js';
+import { loginApp } from './routes/login.js';
+import { consentApp } from './routes/consent.js';
+import {
+  createInMemoryClientResolver,
+  createProviderConfig,
+  type ProviderConfig,
+} from './config.js';
+import {
+  sessionResolver as defaultSessionResolver,
+  consentResolver as defaultConsentResolver,
+} from './resolvers.js';
+import { createViews, type Views } from './views.js';
+import {
+  assertHasRs256Key,
+  assertKeyStrength,
+  assertKidStrategyConsistent,
+  getRegisteredSigningKeys,
+  signingKeysToJwkSet,
+} from '${_corePkg}';
+import type {
+  SigningKey,
+  SigningKeyProvider,
+  ClientResolver,
+  TokenClientResolver,
+  AcrResolver,
+  SessionResolver,
+  ConsentResolver,
+  JwkSet,
+} from '${_corePkg}';
+
+export type CorsOrigins = string | string[];
+
+export interface CreateAppOptions {
+  config?: Partial<ProviderConfig>;
+  /**
+   * Provider for the RSA signing key pair.
+   * Must load keys from your secret store (env var, KV, D1, etc.).
+   * Use createCachedSigningKeyProvider() to refresh the key periodically.
+   * Note: JWKS serves only the current key. Tokens signed with a rotated-out
+   * key will fail verification after the provider returns a new key.
+   */
+  signingKeyProvider: SigningKeyProvider;
+  idTokenSigningKeyProvider?: SigningKeyProvider;
+  userinfoSigningKeyProvider?: SigningKeyProvider;
+  clientResolver?: ClientResolver;
+  tokenClientResolver?: TokenClientResolver;
+  /**
+   * Session resolver used for SSO / prompt=none / max_age
+   * (OIDC Core 1.0 Section 3.1.2.1 / 3.1.2.3).
+   * Defaults to the cookie-based browser session resolver in resolvers.ts.
+   */
+  sessionResolver?: SessionResolver;
+  /**
+   * Consent resolver used by prompt=none to confirm prior consent without UI
+   * (OIDC Core 1.0 Section 3.1.2.1).
+   * Defaults to the in-memory consent store resolver in resolvers.ts.
+   */
+  consentResolver?: ConsentResolver;
+  acrResolver?: AcrResolver;
+  /**
+   * Custom UI for the login / consent / error pages.
+   * Provide any subset; omitted pages fall back to the default views.
+   * Inject your own UI here instead of editing views.ts.
+   */
+  views?: Partial<Views>;
+  /**
+   * JWKS provider used to verify id_token_hint (OIDC Core 1.0 §3.1.2.2).
+   * Omit to use the OP's own ID Token signing keys by default, so an ID Token
+   * the OP issued can be presented back as id_token_hint without extra wiring.
+   * Override only when hints are signed by a different key set.
+   */
+  jwksProvider?: () => Promise<JwkSet> | JwkSet;
+  corsOrigins?: CorsOrigins;
+}
+
+export function validateSigningKeySet(
+  keys: readonly SigningKey[],
+  requireRs256 = false,
+): void {
+  assertKeyStrength(keys);
+  assertKidStrategyConsistent(keys);
+  if (requireRs256) {
+    assertHasRs256Key(keys.map((key) => key.privateKey));
+  }
+}
+
+${methodGuard}
+
+/**
+ * Initialize the OpenID Connect Provider.
+ * Mounts middleware and routes onto the app instance.
+ */
+export function createApp(options: CreateAppOptions): Hono<{ Variables: Record<string, any> }> {
+  // A factory must return an isolated router each time. Keeping this instance at
+  // module scope makes later createApp calls reuse a matcher whose routes were
+  // already finalized and also leaks the first call's middleware/options.
+  const app = new Hono<{ Variables: Record<string, any> }>();
+  const corsOrigins = options.corsOrigins ?? '*';
+  const protectedCors = cors({
+    origin: corsOrigins,
+    allowMethods: ['POST', 'GET', 'OPTIONS'],
+    allowHeaders: ['Authorization', 'Content-Type'],
+    maxAge: 600,
+  });
+  const publicCors = cors({ origin: '*', allowMethods: ['GET', 'OPTIONS'], maxAge: 600 });
+  app.use('/token', protectedCors);
+  app.use('/userinfo', protectedCors);
+${introspectionCors}${revocationCors}  app.use('/.well-known/openid-configuration', publicCors);
+  app.use('/.well-known/jwks.json', publicCors);
+  // CORS must run first so OPTIONS preflights are answered before method enforcement.
+  app.use('*', enforceOidcEndpointMethod);
+
+  // Store runtime dependencies for use by routes.
+  app.use('*', async (c, next) => {
+    let signingKey;
+    let idTokenSigningKey;
+    let userinfoSigningKey;
+    let signingKeys;
+    let idTokenSigningKeys;
+    let userinfoSigningKeys;
+    try {
+      signingKey = await options.signingKeyProvider.getSigningKey();
+      // T-022: surface every registered key so JWKS/Discovery can advertise
+      // rotated-out and alternate-alg keys, not just the active signing key.
+      signingKeys = await getRegisteredSigningKeys(options.signingKeyProvider);
+      const idProvider = options.idTokenSigningKeyProvider ?? options.signingKeyProvider;
+      idTokenSigningKey = await idProvider.getSigningKey();
+      idTokenSigningKeys = await getRegisteredSigningKeys(idProvider);
+      const uiProvider = options.userinfoSigningKeyProvider ?? options.signingKeyProvider;
+      userinfoSigningKey = await uiProvider.getSigningKey();
+      userinfoSigningKeys = await getRegisteredSigningKeys(uiProvider);
+      validateSigningKeySet(signingKeys);
+      validateSigningKeySet(idTokenSigningKeys, true);
+      validateSigningKeySet(userinfoSigningKeys);
+    } catch {
+      return c.json({ error: 'server_error', error_description: 'Failed to load signing key' }, 503);
+    }
+    const { privateKey, publicJwk, keyId } = signingKey;
+    const clientResolver =
+      options.clientResolver ?? createInMemoryClientResolver();
+
+    c.set('privateKey', privateKey);
+    c.set('publicJwk', publicJwk);
+    c.set('keyId', keyId);
+    c.set('signingKeys', signingKeys);
+    c.set('idTokenPrivateKey', idTokenSigningKey.privateKey);
+    c.set('idTokenPublicJwk', idTokenSigningKey.publicJwk);
+    c.set('idTokenKeyId', idTokenSigningKey.keyId);
+    c.set('userinfoPrivateKey', userinfoSigningKey.privateKey);
+    c.set('userinfoPublicJwk', userinfoSigningKey.publicJwk);
+    c.set('userinfoKeyId', userinfoSigningKey.keyId);
+    c.set('idTokenSigningKeys', idTokenSigningKeys);
+    c.set('userinfoSigningKeys', userinfoSigningKeys);
+    c.set('config', createProviderConfig(options.config));
+    c.set('clientResolver', clientResolver);
+    c.set('tokenClientResolver', options.tokenClientResolver ?? clientResolver);
+    // P1: default cookie-based session + consent resolvers so prompt=none /
+    // max_age / SSO work out of the box (OIDC Core 1.0 Section 3.1.2.1 / 3.1.2.3).
+    c.set('sessionResolver', options.sessionResolver ?? defaultSessionResolver);
+    c.set('consentResolver', options.consentResolver ?? defaultConsentResolver);
+    if (options.acrResolver) {
+      c.set('acrResolver', options.acrResolver);
+    }
+    // Inject custom UI (login / consent / error) merged over the defaults.
+    c.set('views', createViews(options.views));
+    // Default jwksProvider verifies id_token_hint against the OP's own ID Token
+    // signing keys (OIDC Core 1.0 §3.1.2.2) so a hint the OP issued validates out
+    // of the box. An explicit options.jwksProvider overrides it. The closure
+    // captures this request's key set so it reflects the latest rotation.
+    c.set('jwksProvider', options.jwksProvider ?? (() => signingKeysToJwkSet(idTokenSigningKeys)));
+    await next();
+  });
+
+  app.route('/authorize', authorizeApp);
+  app.route('/token', tokenApp);
+  app.route('/userinfo', userinfoApp);
+${introspectionMount}${revocationMount}  app.route('/.well-known/jwks.json', jwksApp);
+  app.route('/.well-known/openid-configuration', discoveryApp);
+  app.route('/login', loginApp);
+  app.route('/consent', consentApp);
+
+  return app;
+}
+`;
+}
+
+export function configTemplate(
+  corePkg: string,
+  features: OidcFeatureConfig = DEFAULT_FEATURES,
+): string {
+  const refreshTokenLifetimeField = features.refreshToken
+    ? `  /**
+   * Refresh token の absolute lifetime（秒）。初回発行時刻からの絶対的な有効期限。
+   * OAuth 2.1 §6.1: refresh token rotation で sliding expiry を毎回延長すると、利用者が
+   * リフレッシュし続ける限り RT が無期限に延び、漏洩 RT が長期間 abuse され得る。本実装は
+   * sliding expiry を持たず、RT の expiresAt は initial issuance（originalIssuedAt）からの
+   * この absolute lifetime のみで決まる。rotation しても失効時刻は前に進まない。
+   * 設定例: 90 日 = 7776000。
+   */
+  refreshTokenAbsoluteLifetime: number;
+`
+    : '';
+  const refreshTokenLifetimeDefault = features.refreshToken
+    ? `  // OAuth 2.1 §6.1: refresh token は initial issuance から 90 日（7776000 秒）で必ず失効する。
+  refreshTokenAbsoluteLifetime: 7776000,
+`
+    : '';
+  const allowNonPkceDefault = features.pkce
+    ? `  allowNonPkceAuthorizationCodeFlow: false,
+`
+    : `  // Generated with the pkce feature disabled: PKCE is optional for explicit
+  // confidential clients (public clients and malformed PKCE values are still rejected).
+  allowNonPkceAuthorizationCodeFlow: true,
+`;
+  const allowUnsignedField = features.requestObject
+    ? `  /**
+   * OIDC Core 1.0 §6.1: 署名無し（\`alg: "none"\`）Request Object を互換受理するか。
+   * 既定は false（署名付き Request Object のみ受理）。OIDF Conformance Suite の一部
+   * module は unsigned Request Object を送るため、Basic OP conformance 互換のときだけ
+   * true にする。true の場合は discovery の request_object_signing_alg_values_supported に
+   * "none" も広告される。
+   */
+  allowUnsignedRequestObject: boolean;
+`
+    : '';
+  const allowUnsignedDefault = features.requestObject
+    ? `  // OIDC Core 1.0 §6.1: require signed Request Objects by default; enable only for
+  // Basic OP conformance compatibility where the suite sends unsigned ones.
+  allowUnsignedRequestObject: false,
+`
+    : '';
+  const exampleClientGrantFields = features.refreshToken
+    ? `      offlineAccessAllowed: true,
+      // RFC 7591 §2: grant_types default is ["authorization_code"]. This client uses
+      // offline_access (refresh tokens), so it must explicitly register refresh_token.
+      grantTypes: ['authorization_code', 'refresh_token'],
+`
+    : `      // RFC 7591 §2: grant_types default is ["authorization_code"]. The refresh_token
+      // grant is disabled in this generated provider, so only authorization_code is registered.
+      grantTypes: ['authorization_code'],
+`;
+  return `import type {
+  ClientInfo,
+  ClientResolver,
+  TokenClientInfo,
+  TokenClientResolver,
+} from '${corePkg}';
+
+export interface ProviderConfig {
+  issuer: string;
+  accessTokenExpiresIn: number;
+  idTokenExpiresIn: number;
+${refreshTokenLifetimeField}  /**
+   * アクセストークンの形式。
+   * - 'jwt' (デフォルト): 自己完結。ステートレス検証可能だが即時失効が困難。
+   * - 'opaque'         : 不透明文字列。リソースサーバは Introspection / ストア参照で検証。
+   *                      Revocation との相性が良く、即時失効が必要なケースに向く。
+   */
+  accessTokenFormat: 'jwt' | 'opaque';
+  /**
+   * Authorization code の有効期間（秒）。OIDC Core 1.0 §3.1.3.1 は authorization code を
+   * short-lived にすることを求めており（推奨上限 10 分）、本ライブラリは core helper の
+   * デフォルトと同じ 300 秒（5 分）を既定値とする。PoC でタイムアウト挙動を確認したい場合は
+   * この値を縮めて検証できる。
+   */
+  authorizationCodeTtl: number;
+  /**
+   * OpenID Foundation Basic OP static-client conformance 互換モード。
+   * false の場合はOAuth 2.1方針としてPKCE(S256)を必須にする。true の場合でも
+   * core 側は明示的な confidential client の完全な非PKCE requestだけを許可し、
+   * 不正なPKCE値やpublic clientの非PKCE requestは拒否する。
+   */
+  allowNonPkceAuthorizationCodeFlow: boolean;
+${allowUnsignedField}  /**
+   * 任意。client redirect が禁止される非リダイレクト型の authorization error
+   * （未知 client_id / 未登録 redirect_uri / fragment 付き redirect_uri など、
+   * OIDC Core 1.0 §3.1.2.2）の HTML フォールバックを、views.errorPage() で直接
+   * 返す代わりに OP 内部のエラーページパスへ 303 リダイレクトしたいときに設定する。
+   * Next.js の error.tsx のような framework-native なエラー画面へ委ねるためのフック。
+   * 未設定なら従来どおり views.errorPage() を c.html で返す（express/fastify/hono の
+   * デフォルト）。なお Accept: application/json の programmatic caller には、この設定の
+   * 有無に関わらず常に 400 の OAuth error JSON を返す。
+   */
+  authorizationErrorRedirectPath?: string;
+}
+
+/**
+ * Optional defaults for quick local testing.
+ * Production code should create ProviderConfig from environment variables,
+ * KV, D1, or another project-owned configuration source.
+ */
+export const defaultProviderConfig: ProviderConfig = {
+  issuer: 'http://localhost:3000',
+  accessTokenExpiresIn: 3600,
+  idTokenExpiresIn: 3600,
+${refreshTokenLifetimeDefault}  accessTokenFormat: 'jwt',
+  // OIDC Core 1.0 §3.1.3.1: authorization code は short-lived であるべき（5 分 = 300 秒）。
+  authorizationCodeTtl: 300,
+${allowNonPkceDefault}${allowUnsignedDefault}};
+
+export function createProviderConfig(
+  overrides: Partial<ProviderConfig> = {},
+): ProviderConfig {
+  return {
+    ...defaultProviderConfig,
+    ...overrides,
+  };
+}
+
+/**
+ * Extended client info with offline_access permission.
+ * offlineAccessAllowed: controls whether the client may request refresh tokens
+ * via the offline_access scope (OAuth 2.1 / OIDC offline_access).
+ *
+ * userinfoSignedResponseAlg: when set, the UserInfo endpoint returns a signed JWT
+ * with content-type \`application/jwt\` (OIDC Core 1.0 Section 5.3.2 — client metadata
+ * \`userinfo_signed_response_alg\`). The endpoint picks a registered UserInfo signing
+ * key whose alg matches this value (mirroring idTokenSignedResponseAlg), so the
+ * response is signed with the requested alg — not limited to RS256. A request whose
+ * alg has no registered key is rejected as a server configuration error.
+ *
+ * idTokenSignedResponseAlg: chooses the JWA alg for this client's ID Token
+ * (OIDC Dynamic Client Registration 1.0 §2 — client metadata
+ * \`id_token_signed_response_alg\`). When omitted, the OIDC default \`RS256\` is used.
+ * The token endpoint picks an actual signing key matching this alg from the
+ * registered ID Token key set; a request whose alg has no registered key is
+ * rejected as a server configuration error.
+ */
+export type RegisteredClient = ClientInfo & TokenClientInfo & {
+  offlineAccessAllowed?: boolean;
+  userinfoSignedResponseAlg?: 'RS256' | 'ES256';
+  idTokenSignedResponseAlg?: 'RS256' | 'ES256';
+};
+
+/**
+ * Optional in-memory defaults for quick local testing only.
+ * Prefer D1, KV, or another project-owned client resolver in real projects.
+ */
+export const defaultRegisteredClients: ReadonlyMap<string, RegisteredClient> = new Map([
+  [
+    'example-client',
+    {
+      clientId: 'example-client',
+      clientSecret: 'example-secret',
+      redirectUris: ['http://localhost:3000/callback'],
+      clientType: 'confidential' as const,
+${exampleClientGrantFields}      // RFC 7591 §2: token_endpoint_auth_method default is client_secret_basic.
+      // The sample client authenticates with client_secret_post, so register it explicitly.
+      tokenEndpointAuthMethod: 'client_secret_post',
+      // OIDC Dynamic Client Registration 1.0 §2: default_max_age (seconds).
+      // When the authorization request omits max_age, the OP applies this as the
+      // default re-authentication freshness. A request-supplied max_age overrides it.
+      defaultMaxAge: 3600,
+    },
+  ],
+]);
+
+export function createInMemoryClientResolver(
+  clients: ReadonlyMap<string, RegisteredClient> = defaultRegisteredClients,
+): ClientResolver & TokenClientResolver {
+  return {
+    async findClient(clientId: string): Promise<RegisteredClient | null> {
+      return clients.get(clientId) ?? null;
+    },
+  };
+}
+`;
+}
+
+export function storeTemplate(corePkg: string): string {
+  return `import type {
+  AuthTransaction,
+  AuthTransactionStore,
+  AuthorizationCodeInfo,
+  AccessTokenInfo,
+  RefreshTokenInfo,
+  UserClaims,
+} from '${corePkg}';
+
+/**
+ * In-memory Authorization Transaction Store.
+ * In production, replace with a persistent store (e.g., Redis, database).
+ */
+export class InMemoryTransactionStore implements AuthTransactionStore {
+  private store = new Map<string, { value: AuthTransaction; expiresAt: number }>();
+
+  async get(key: string): Promise<AuthTransaction | null> {
+    const entry = this.store.get(key);
+    if (!entry) return null;
+    if (Date.now() > entry.expiresAt) {
+      this.store.delete(key);
+      return null;
+    }
+    return entry.value;
+  }
+
+  async put(key: string, value: AuthTransaction, ttlSeconds: number): Promise<void> {
+    this.store.set(key, { value, expiresAt: Date.now() + (ttlSeconds * 1000) });
+  }
+
+  async delete(key: string): Promise<void> {
+    this.store.delete(key);
+  }
+}
+
+/**
+ * In-memory Authorization Code Store.
+ * Stores issued authorization codes and their associated data.
+ */
+export class AuthorizationCodeStore {
+  private codes = new Map<string, AuthorizationCodeInfo>();
+
+  set(code: string, info: AuthorizationCodeInfo): void {
+    this.codes.set(code, info);
+  }
+
+  get(code: string): AuthorizationCodeInfo | undefined {
+    const entry = this.codes.get(code);
+    if (!entry) return undefined;
+    const now = Math.floor(Date.now() / 1000);
+    if (entry.expiresAt <= now) {
+      this.codes.delete(code);
+      return undefined;
+    }
+    return entry;
+  }
+
+  // Mark the authorization code as used (do NOT physically delete it).
+  // OAuth 2.1 §4.1.2 / RFC 9700 §4.13: a replayed code must still be findable as
+  // used:true so revokeAuthorizationCode can detect reuse and revoke the grant's
+  // tokens. The resolver path uses consume(); see delete() for physical removal.
+  consume(code: string): void {
+    const entry = this.codes.get(code);
+    if (entry) {
+      entry.used = true;
+    }
+  }
+
+  // Physically remove the entry. Use only where physical deletion is correct
+  // (e.g. expired-entry eviction), never as the resolver's "code used" path —
+  // that must be consume() so reuse detection keeps working.
+  delete(code: string): void {
+    this.codes.delete(code);
+  }
+}
+
+/**
+ * In-memory Access Token Store.
+ * Stores issued access tokens for UserInfo endpoint validation.
+ */
+export class AccessTokenStore {
+  private tokens = new Map<string, AccessTokenInfo>();
+
+  set(token: string, info: AccessTokenInfo): void {
+    this.tokens.set(token, info);
+  }
+
+  get(token: string): AccessTokenInfo | undefined {
+    const entry = this.tokens.get(token);
+    if (!entry) return undefined;
+    // Lazy eviction (RFC 6819 §5.1.5.3 / RFC 9700 §4.14): drop expired entries on
+    // read so an idle in-memory store does not grow unbounded. Correctness is already
+    // guaranteed by the core expiry check; this only bounds retention.
+    const now = Math.floor(Date.now() / 1000);
+    if (entry.expiresAt <= now) {
+      this.tokens.delete(token);
+      return undefined;
+    }
+    return entry;
+  }
+
+  delete(token: string): void {
+    this.tokens.delete(token);
+  }
+
+  // OAuth 2.1 Section 4.1.2: revoke all access tokens issued under a given grant
+  // when the originating authorization code is reused.
+  revokeByGrantId(grantId: string): void {
+    for (const [token, info] of this.tokens) {
+      if (info.grantId === grantId) {
+        this.tokens.delete(token);
+      }
+    }
+  }
+
+  /** Revoke a single access token. Used by RFC 7009 revocation endpoint. */
+  revoke(token: string): void {
+    this.tokens.delete(token);
+  }
+}
+
+/**
+ * In-memory Refresh Token Store.
+ * Stores issued refresh tokens for token rotation.
+ * OAuth 2.1 Section 4.3
+ */
+export class RefreshTokenStore {
+  private tokens = new Map<string, RefreshTokenInfo>();
+
+  set(token: string, info: RefreshTokenInfo): void {
+    this.tokens.set(token, info);
+  }
+
+  get(token: string): RefreshTokenInfo | undefined {
+    const entry = this.tokens.get(token);
+    if (!entry) return undefined;
+    // Lazy eviction only past the absolute lifetime (expiresAt). A used=true but
+    // still-in-lifetime entry MUST remain so rotation-reuse detection (revokeByGrantId)
+    // keeps firing (OAuth 2.1 4.3.1 / RFC 9700 4.13). Eviction never keys on the used flag.
+    const now = Math.floor(Date.now() / 1000);
+    if (entry.expiresAt <= now) {
+      this.tokens.delete(token);
+      return undefined;
+    }
+    return entry;
+  }
+
+  // Mark the rotated refresh token as used (do NOT physically delete it).
+  // OAuth 2.1 §4.3.1 / RFC 9700 §4.13: a replayed (already-rotated) refresh token
+  // must remain findable as used:true so reuse detection can revoke the grant.
+  // The resolver path uses consume(); see delete() for physical removal.
+  consume(token: string): void {
+    const entry = this.tokens.get(token);
+    if (entry) {
+      entry.used = true;
+    }
+  }
+
+  // Physically remove the entry. Use only where physical deletion is correct
+  // (e.g. revocation / grant cascade / expired-entry eviction), never as the
+  // resolver's "rotated" path — that must be consume() to keep reuse detection.
+  delete(token: string): void {
+    this.tokens.delete(token);
+  }
+
+  // OAuth 2.1 Section 4.1.2: revoke all refresh tokens (including rotated ones)
+  // sharing the given grantId when the originating authorization code is reused.
+  revokeByGrantId(grantId: string): void {
+    for (const [token, info] of this.tokens) {
+      if (info.grantId === grantId) {
+        this.tokens.delete(token);
+      }
+    }
+  }
+
+  /** Revoke a single refresh token. Used by RFC 7009 revocation endpoint. */
+  revoke(token: string): void {
+    this.tokens.delete(token);
+  }
+}
+
+/**
+ * In-memory authenticated session store.
+ * Keeps login results between login and consent steps.
+ */
+export interface AuthSessionInfo {
+  subject: string;
+  authTime: number;
+}
+
+export class AuthSessionStore {
+  private sessions = new Map<string, AuthSessionInfo>();
+
+  set(transactionId: string, info: AuthSessionInfo): void {
+    this.sessions.set(transactionId, info);
+  }
+
+  get(transactionId: string): AuthSessionInfo | undefined {
+    return this.sessions.get(transactionId);
+  }
+
+  delete(transactionId: string): void {
+    this.sessions.delete(transactionId);
+  }
+}
+
+/**
+ * Browser (OP) session store - OIDC Core 1.0 Section 3.1.2.3.
+ * Unlike AuthSessionStore (a per-transaction login -> consent handoff), this
+ * persists across authorization requests, keyed by an opaque session_id carried
+ * in an HttpOnly cookie. It is what makes SSO, prompt=none and max_age work.
+ * In production, replace with a persistent store (e.g., KV, database).
+ */
+export const SESSION_COOKIE_NAME = 'session_id';
+
+export interface BrowserSessionInfo {
+  subject: string;
+  authTime: number;
+}
+
+export class BrowserSessionStore {
+  private sessions = new Map<string, BrowserSessionInfo>();
+
+  set(sessionId: string, info: BrowserSessionInfo): void {
+    this.sessions.set(sessionId, info);
+  }
+
+  get(sessionId: string): BrowserSessionInfo | undefined {
+    return this.sessions.get(sessionId);
+  }
+
+  delete(sessionId: string): void {
+    this.sessions.delete(sessionId);
+  }
+}
+
+/**
+ * Extract the session_id value from a Cookie request header.
+ * Returns undefined when the header is missing or the cookie is absent.
+ */
+export function parseSessionId(cookieHeader: string | null): string | undefined {
+  if (!cookieHeader) return undefined;
+  for (const part of cookieHeader.split(';')) {
+    const trimmed = part.trim();
+    const eq = trimmed.indexOf('=');
+    if (eq === -1) continue;
+    if (trimmed.slice(0, eq) === SESSION_COOKIE_NAME) {
+      return trimmed.slice(eq + 1);
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Build the Set-Cookie value for the browser session.
+ * Attributes per study-material/http-security-headers-and-tls.md:
+ * HttpOnly (no JS access), Secure (HTTPS only), SameSite=Lax. SameSite=Strict
+ * would drop the cookie on the cross-site authorization redirect return and
+ * break the flow, so Lax is required.
+ */
+export function buildSessionCookie(sessionId: string): string {
+  return SESSION_COOKIE_NAME + '=' + sessionId + '; HttpOnly; Secure; SameSite=Lax; Path=/';
+}
+
+/**
+ * In-memory consent store. Records that a user granted a set of scopes to a
+ * client so prompt=none can confirm consent without showing UI
+ * (OIDC Core 1.0 Section 3.1.2.1).
+ */
+export class ConsentStore {
+  private grants = new Map<string, Map<string, Set<string>>>();
+  // One consent can authorize multiple code flows. Keep every resulting grantId
+  // indexed by subject + client so a user-initiated "remove access" operation
+  // can revoke the complete AT/RT families without touching another client.
+  private grantIds = new Map<string, Map<string, Set<string>>>();
+
+  grant(subject: string, clientId: string, scopes: string[]): void {
+    let byClient = this.grants.get(subject);
+    if (!byClient) {
+      byClient = new Map<string, Set<string>>();
+      this.grants.set(subject, byClient);
+    }
+    const granted = byClient.get(clientId) ?? new Set<string>();
+    for (const s of scopes) granted.add(s);
+    byClient.set(clientId, granted);
+  }
+
+  hasConsent(subject: string, clientId: string, scopes: string[]): boolean {
+    const granted = this.grants.get(subject)?.get(clientId);
+    if (!granted) return false;
+    return scopes.every((s) => granted.has(s));
+  }
+
+  recordGrant(subject: string, clientId: string, grantId: string): void {
+    let byClient = this.grantIds.get(subject);
+    if (!byClient) {
+      byClient = new Map<string, Set<string>>();
+      this.grantIds.set(subject, byClient);
+    }
+    const ids = byClient.get(clientId) ?? new Set<string>();
+    ids.add(grantId);
+    byClient.set(clientId, ids);
+  }
+
+  // Revoke all consent the subject granted to a client (e.g. "remove access")
+  // and atomically detach the grant ids that the caller must cascade-revoke.
+  revoke(subject: string, clientId: string): string[] {
+    const ids = [...(this.grantIds.get(subject)?.get(clientId) ?? [])];
+    this.grants.get(subject)?.delete(clientId);
+    this.grantIds.get(subject)?.delete(clientId);
+    return ids;
+  }
+}
+
+/**
+ * In-memory User Store.
+ * Stores user profiles for authentication and UserInfo responses.
+ * In production, replace with a database-backed user store.
+ */
+export class UserStore {
+  private users = new Map<string, UserClaims & { password: string }>();
+
+  constructor() {
+    // Example user for development.
+    // Carries the standard claims for every scope advertised in Discovery
+    // (profile / email / address / phone — OIDC Core 1.0 §5.4) so the OIDF
+    // Conformance Suite's VerifyScopesReturnedInUserInfoClaims finds a value for
+    // each requested scope. filterClaimsByScope still gates what is returned per
+    // scope; populating the fixture is the resolver's responsibility.
+    this.users.set('testuser', {
+      sub: 'testuser',
+      // profile scope
+      name: 'Test User',
+      family_name: 'User',
+      given_name: 'Test',
+      middle_name: 'Q',
+      nickname: 'testy',
+      preferred_username: 'testuser',
+      profile: 'https://op.example.com/users/testuser',
+      picture: 'https://op.example.com/users/testuser/avatar.png',
+      website: 'https://testuser.example.com',
+      gender: 'unspecified',
+      birthdate: '1990-01-01',
+      zoneinfo: 'Asia/Tokyo',
+      locale: 'en-US',
+      updated_at: 1700000000,
+      // email scope
+      email: 'test@example.com',
+      email_verified: true,
+      // address scope
+      address: {
+        formatted: '100 Test Street, Test City, TS 10000, JP',
+        street_address: '100 Test Street',
+        locality: 'Test City',
+        region: 'TS',
+        postal_code: '10000',
+        country: 'JP',
+      },
+      // phone scope
+      phone_number: '+81-3-0000-0000',
+      phone_number_verified: true,
+      password: 'password',
+    });
+
+    // A second fixture makes subject-isolation and id_token_hint/session mismatch
+    // flows reproducible with real signed tokens. It is development-only example
+    // data, not a multi-account policy for production integrations.
+    this.users.set('otheruser', {
+      sub: 'otheruser',
+      name: 'Other User',
+      preferred_username: 'otheruser',
+      email: 'other@example.com',
+      email_verified: true,
+      password: 'password',
+    });
+  }
+
+  authenticate(username: string, password: string): (UserClaims & { password: string }) | undefined {
+    const user = this.users.get(username);
+    if (user && user.password === password) {
+      return user;
+    }
+    return undefined;
+  }
+
+  getClaims(sub: string): UserClaims | undefined {
+    const user = this.users.get(sub);
+    if (!user) return undefined;
+    const { password: _, ...claims } = user;
+    return claims;
+  }
+}
+
+// Singleton store instances.
+//
+// Backed by globalThis so a single instance is shared process-wide. This is
+// required on Next.js, where Server Components / Server Actions and Route
+// Handlers are instantiated in separate module layers: a plain
+// \`new Store()\` module export would produce a different instance per layer, so
+// state written by the login/consent pages (transactions, sessions, consent)
+// would be invisible to the /authorize and /token route handlers and vice
+// versa. It also survives dev-mode hot reloads. Harmless for single-layer
+// runtimes (Node / Hono / Express / Fastify), which always see one instance.
+const storeRegistry = globalThis as typeof globalThis & {
+  __oidcProviderStores?: {
+    transactionStore: InMemoryTransactionStore;
+    authCodeStore: AuthorizationCodeStore;
+    accessTokenStore: AccessTokenStore;
+    refreshTokenStore: RefreshTokenStore;
+    authSessionStore: AuthSessionStore;
+    browserSessionStore: BrowserSessionStore;
+    consentStore: ConsentStore;
+    userStore: UserStore;
+  };
+};
+
+const stores = (storeRegistry.__oidcProviderStores ??= {
+  transactionStore: new InMemoryTransactionStore(),
+  authCodeStore: new AuthorizationCodeStore(),
+  accessTokenStore: new AccessTokenStore(),
+  refreshTokenStore: new RefreshTokenStore(),
+  authSessionStore: new AuthSessionStore(),
+  browserSessionStore: new BrowserSessionStore(),
+  consentStore: new ConsentStore(),
+  userStore: new UserStore(),
+});
+
+export const transactionStore = stores.transactionStore;
+export const authCodeStore = stores.authCodeStore;
+export const accessTokenStore = stores.accessTokenStore;
+export const refreshTokenStore = stores.refreshTokenStore;
+export const authSessionStore = stores.authSessionStore;
+export const browserSessionStore = stores.browserSessionStore;
+export const consentStore = stores.consentStore;
+export const userStore = stores.userStore;
+`;
+}
+
+export function resolversTemplate(
+  corePkg: string,
+  features: OidcFeatureConfig = DEFAULT_FEATURES,
+): string {
+  const refreshTypeImports = features.refreshToken
+    ? `  RefreshTokenResolver,
+  RefreshTokenInfo,
+`
+    : '';
+  const introspectionTypeImports = features.introspection
+    ? `  IntrospectionAccessTokenResolver,
+  IntrospectionRefreshTokenResolver,
+`
+    : '';
+  const revocationTypeImports = features.revocation
+    ? `  RevocationTokenResolvers,
+`
+    : '';
+  const refreshTokenResolverBlock = features.refreshToken
+    ? `/**
+ * Refresh Token Resolver for Token Endpoint.
+ * OAuth 2.1 Section 4.3
+ */
+export const refreshTokenResolver: RefreshTokenResolver = {
+  async resolve(token: string): Promise<RefreshTokenInfo | null> {
+    return refreshTokenStore.get(token) ?? null;
+  },
+  async revokeRefreshToken(token: string): Promise<void> {
+    refreshTokenStore.consume(token);
+  },
+  // OAuth 2.1 Section 4.3.1: refresh token の再利用を検知した時は同 grant の
+  // AT/RT をすべて失効する SHOULD。
+  async revokeTokensByGrantId(grantId: string): Promise<void> {
+    accessTokenStore.revokeByGrantId(grantId);
+    refreshTokenStore.revokeByGrantId(grantId);
+  },
+};
+
+`
+    : '';
+  const introspectionResolversBlock = features.introspection
+    ? `/**
+ * Resolvers for RFC 7662 Token Introspection.
+ * Reuses the same in-memory stores as UserInfo / token rotation.
+ */
+export const introspectionAccessTokenResolver: IntrospectionAccessTokenResolver = {
+  async findAccessToken(token) {
+    return accessTokenStore.get(token) ?? null;
+  },
+};
+
+export const introspectionRefreshTokenResolver: IntrospectionRefreshTokenResolver = {
+  async resolve(token) {
+    return refreshTokenStore.get(token) ?? null;
+  },
+};
+
+`
+    : '';
+  const revocationResolversBlock = features.revocation
+    ? `/**
+ * Resolvers for RFC 7009 Token Revocation.
+ *
+ * RFC 7009 Section 2.1 SHOULD: revoking a refresh token also revokes all
+ * access tokens that share the same grantId.
+ */
+export const revocationResolvers: RevocationTokenResolvers = {
+  async findAccessToken(token) {
+    return accessTokenStore.get(token) ?? null;
+  },
+  async revokeAccessToken(token) {
+    accessTokenStore.revoke(token);
+  },
+  async findRefreshToken(token) {
+    return refreshTokenStore.get(token) ?? null;
+  },
+  async revokeRefreshToken(token) {
+    refreshTokenStore.revoke(token);
+  },
+  async revokeAccessTokensByGrantId(grantId) {
+    accessTokenStore.revokeByGrantId(grantId);
+  },
+};
+
+`
+    : '';
+  return `import type {
+  ClientResolver,
+  TokenClientResolver,
+  AuthorizationCodeResolver,
+  AuthorizationCodeInfo,
+  AccessTokenResolver,
+  AccessTokenInfo,
+${refreshTypeImports}  UserClaimsResolver,
+  UserClaims,
+${introspectionTypeImports}${revocationTypeImports}  SessionResolver,
+  SessionInfo,
+  ConsentResolver,
+} from '${corePkg}';
+import { createInMemoryClientResolver } from './config.js';
+import {
+  authCodeStore,
+  accessTokenStore,
+  refreshTokenStore,
+  userStore,
+  browserSessionStore,
+  consentStore,
+  parseSessionId,
+} from './store.js';
+
+/**
+ * Default in-memory client resolver for quick local testing.
+ * Project integrations should inject a D1/KV/env-backed resolver through Hono context.
+ */
+export const clientResolver: ClientResolver & TokenClientResolver =
+  createInMemoryClientResolver();
+
+export const tokenClientResolver: TokenClientResolver = clientResolver;
+
+/**
+ * Authorization Code Resolver for Token Endpoint.
+ */
+export const authorizationCodeResolver: AuthorizationCodeResolver = {
+  async findAuthorizationCode(code: string): Promise<AuthorizationCodeInfo | null> {
+    const entry = authCodeStore.get(code);
+    if (!entry) return null;
+    return entry;
+  },
+  async revokeAuthorizationCode(code: string): Promise<void> {
+    authCodeStore.consume(code);
+  },
+  // OAuth 2.1 Section 4.1.2 / RFC 6749 Section 4.1.2:
+  // SHOULD revoke all tokens previously issued from a reused authorization code.
+  async revokeTokensByGrantId(grantId: string): Promise<void> {
+    accessTokenStore.revokeByGrantId(grantId);
+    refreshTokenStore.revokeByGrantId(grantId);
+  },
+};
+
+/**
+ * Access Token Resolver for UserInfo Endpoint.
+ */
+export const accessTokenResolver: AccessTokenResolver = {
+  async findAccessToken(token: string): Promise<AccessTokenInfo | null> {
+    return accessTokenStore.get(token) ?? null;
+  },
+};
+
+${refreshTokenResolverBlock}/**
+ * User Claims Resolver for UserInfo Endpoint.
+ */
+export const userClaimsResolver: UserClaimsResolver = {
+  async findUserClaims(sub: string): Promise<UserClaims | null> {
+    return userStore.getClaims(sub) ?? null;
+  },
+};
+
+${introspectionResolversBlock}${revocationResolversBlock}/**
+ * Default session resolver: reads the browser session cookie and looks up the
+ * active OP session (OIDC Core 1.0 Section 3.1.2.3). This is what enables SSO
+ * and silent authentication (prompt=none) across authorization requests.
+ */
+export const sessionResolver: SessionResolver = {
+  async resolve(request: Request): Promise<SessionInfo | null> {
+    const sessionId = parseSessionId(request.headers.get('Cookie'));
+    if (!sessionId) return null;
+    const session = browserSessionStore.get(sessionId);
+    if (!session) return null;
+    return { subject: session.subject, authTime: session.authTime };
+  },
+};
+
+/**
+ * Default consent resolver backed by the in-memory consent store.
+ * OIDC Core 1.0 Section 3.1.2.1: prompt=none must reject with consent_required
+ * when consent has not been previously granted.
+ */
+export type GrantAwareConsentResolver = ConsentResolver & {
+  recordGrant(subject: string, clientId: string, grantId: string): Promise<void>;
+};
+
+/**
+ * User-facing "remove access" coordinator. The consent index is cleared first,
+ * then every grant family for that subject/client is synchronously revoked.
+ * Production stores must provide strongly consistent reads for this operation so
+ * prompt=none and token use cannot observe stale consent or stale tokens.
+ */
+export async function revokeConsentAndTokens(subject: string, clientId: string): Promise<void> {
+  const grantIds = consentStore.revoke(subject, clientId);
+  for (const grantId of grantIds) {
+    await authorizationCodeResolver.revokeTokensByGrantId?.(grantId);
+  }
+}
+
+export const consentResolver: GrantAwareConsentResolver = {
+  async hasConsent(subject: string, clientId: string, scopes: string[]): Promise<boolean> {
+    return consentStore.hasConsent(subject, clientId, scopes);
+  },
+  // OIDC Core 1.0 Section 3.1.2.4: record the user's consent so a later
+  // prompt=none (or non-interactive) request can confirm it without UI.
+  async recordConsent(subject: string, clientId: string, scopes: string[]): Promise<void> {
+    consentStore.grant(subject, clientId, scopes);
+  },
+  async recordGrant(subject: string, clientId: string, grantId: string): Promise<void> {
+    consentStore.recordGrant(subject, clientId, grantId);
+  },
+  async revokeConsent(subject: string, clientId: string): Promise<void> {
+    await revokeConsentAndTokens(subject, clientId);
+  },
+};
+`;
+}
+
+export function authorizeRouteTemplate(
+  corePkg: string,
+  features: OidcFeatureConfig = DEFAULT_FEATURES,
+): string {
+  const offlineAccessComment = features.refreshToken
+    ? `    // OIDC Core 1.0 §11: offline_access requires prompt=consent (or another granting condition).
+    // Default behavior: validateAuthorizationRequest drops offline_access from scope unless
+    // prompt=consent is present. To inject your own grant policy (e.g. honor a previously
+    // recorded user consent), pass an options object with isOfflineAccessGranted:
+    //   await validateAuthorizationRequest(params, clientResolver, {
+    //     isOfflineAccessGranted: (req, { promptValues }) => promptValues.includes('consent') || hasStoredConsent(req),
+    //   });
+`
+    : `    // The refresh_token feature is disabled in this generated provider:
+    // isOfflineAccessGranted always returns false, so offline_access is never
+    // granted (OIDC Core 1.0 §11 requires ignoring the request in that case).
+`;
+  const offlineAccessOption = features.refreshToken
+    ? ''
+    : `        isOfflineAccessGranted: () => false,
+`;
+  const requestObjectOption = features.requestObject
+    ? `        // OIDC Core 1.0 §6.1: verify signed Request Objects (request parameter)
+        // against the client's registered JWKS. RS256 is required; alg=none is
+        // accepted only when allowUnsignedRequestObject is enabled (conformance compat).
+        requestObject: {
+          allowUnsigned: config.allowUnsignedRequestObject,
+        },
+`
+    : `        // OIDC Core 1.0 §6.3: the request parameter (Request Object) is disabled in
+        // this generated provider and rejected with request_not_supported.
+        requestObject: { supported: false },
+`;
+  return `import { Hono } from 'hono';
+import {
+  validateAuthorizationRequest,
+  validateIdTokenHint,
+  createAuthTransaction,
+  createAuthorizationCode,
+  completeAuthTransaction,
+  generateRandomString,
+  checkPromptNone,
+  requiresReauthentication,
+  sanitizeErrorDescription,
+  AuthorizationError,
+  IdTokenHintError,
+  type AuthorizationRequestParams,
+  type JwkSet,
+} from '${corePkg}';
+import { clientResolver as defaultClientResolver } from '../resolvers.js';
+import {
+  transactionStore as defaultTransactionStore,
+  authCodeStore as defaultAuthCodeStore,
+  authSessionStore as defaultAuthSessionStore,
+} from '../store.js';
+import { defaultViews, renderView } from '../views.js';
+
+export const authorizeApp = new Hono<{ Variables: Record<string, any> }>();
+
+/**
+ * Narrows raw query-string params to the typed AuthorizationRequestParams.
+ * PKCE parameters are validated by core so conformance compatibility mode can
+ * intentionally pass requests that omit them.
+ */
+function isAuthorizationRequestParams(
+  params: unknown,
+): params is AuthorizationRequestParams {
+  if (typeof params !== 'object' || params === null) return false;
+  const p = params as Record<string, unknown>;
+  return typeof p['client_id'] === 'string';
+}
+
+/**
+ * Builds a redirect URL with an OAuth error response.
+ * OIDC Core 1.0 Section 3.1.2.6 / RFC 6749 Section 4.1.2.1.
+ *
+ * errorDescription is optional; when supplied it is sanitized to the RFC 6749
+ * Section 5.2 allowed character set before being appended so user-controlled
+ * fragments cannot smuggle control bytes into the redirect URL.
+ *
+ * RFC 9207 §2: when issuer is provided, the iss parameter is appended so the
+ * client can pin the issuer that produced this authorization response.
+ */
+function buildErrorRedirect(
+  redirectUri: string,
+  error: string,
+  state?: string,
+  errorDescription?: string,
+  issuer?: string,
+): string {
+  const url = new URL(redirectUri);
+  url.searchParams.set('error', error);
+  if (errorDescription) {
+    url.searchParams.set('error_description', sanitizeErrorDescription(errorDescription));
+  }
+  if (state) url.searchParams.set('state', state);
+  if (issuer) url.searchParams.set('iss', issuer);
+  return url.toString();
+}
+
+/**
+ * Iterates URLSearchParams and reports the first repeated key, if any.
+ * OIDC Core 1.0 §3.1.2.1 / RFC 6749 §3.1: authorization request parameters
+ * MUST NOT be repeated. Object.fromEntries(searchParams) silently keeps the
+ * last value, which would let \`response_type=code&response_type=token\` slip
+ * through, so we scan entries explicitly.
+ */
+function collectUniqueParams(
+  searchParams: URLSearchParams,
+): { params: Record<string, string>; duplicateKey?: string } {
+  const params: Record<string, string> = {};
+  const seen = new Set<string>();
+  for (const [key, value] of searchParams) {
+    if (seen.has(key)) {
+      return { params, duplicateKey: key };
+    }
+    seen.add(key);
+    params[key] = value;
+  }
+  return { params };
+}
+
+/**
+ * OIDC Core 1.0 Section 3.1.2.1 / Section 13.2: parses the authorization request
+ * parameters from either GET (query string) or POST (application/x-www-form-urlencoded).
+ * Returns null if the request transport is invalid (e.g. unsupported Content-Type on POST).
+ */
+async function parseAuthorizationRequestParams(
+  c: any,
+): Promise<{ params: Record<string, string>; duplicateKey?: string } | null> {
+  if (c.req.method === 'POST') {
+    const contentType = c.req.header('Content-Type') ?? '';
+    // OIDC Core 1.0 Section 13.2: POST must use application/x-www-form-urlencoded.
+    if (!contentType.toLowerCase().split(';')[0].trim().startsWith('application/x-www-form-urlencoded')) {
+      return null;
+    }
+    // Read the raw body so URLSearchParams preserves duplicate keys
+    // (parseBody silently dedupes them).
+    const raw = await c.req.text();
+    return collectUniqueParams(new URLSearchParams(raw));
+  }
+  return collectUniqueParams(new URL(c.req.url).searchParams);
+}
+
+/**
+ * Authorization Endpoint handler shared by GET and POST.
+ * OIDC Core 1.0 Section 3.1.2
+ */
+const handleAuthorizationRequest = async (c: any) => {
+  const parsed = await parseAuthorizationRequestParams(c);
+
+  if (parsed === null) {
+    return c.json({ error: 'invalid_request', error_description: 'Authorization POST requests must use application/x-www-form-urlencoded' }, 400);
+  }
+
+  // OIDC Core 1.0 §3.1.2.1 / RFC 6749 §3.1: request parameters MUST NOT be repeated.
+  if (parsed.duplicateKey !== undefined) {
+    return c.json({ error: 'invalid_request', error_description: \`Parameter "\${parsed.duplicateKey}" must not be repeated\` }, 400);
+  }
+
+  const rawParams = parsed.params;
+
+  if (!isAuthorizationRequestParams(rawParams)) {
+    return c.json({ error: 'invalid_request', error_description: 'Missing required parameter: client_id' }, 400);
+  }
+
+  const params = rawParams;
+
+  try {
+    const clientResolver = c.get('clientResolver') ?? defaultClientResolver;
+    const transactionStore = c.get('transactionStore') ?? defaultTransactionStore;
+    const authCodeStore = c.get('authCodeStore') ?? defaultAuthCodeStore;
+    // RFC 9207 §2: include the issuer identifier on every authorization
+    // response (success and error) so clients can pin the issuer that
+    // produced the response.
+    const config = c.get('config');
+    const issuer = config.issuer;
+
+${offlineAccessComment}    const validatedRequest = await validateAuthorizationRequest(
+      params,
+      clientResolver,
+      {
+        allowNonPkceAuthorizationCodeFlow: config.allowNonPkceAuthorizationCodeFlow,
+${offlineAccessOption}${requestObjectOption}      },
+    );
+
+    // Create authentication transaction
+    const csrfToken = await generateRandomString(32);
+    const transaction = createAuthTransaction(validatedRequest, csrfToken);
+    const transactionId = await generateRandomString(32);
+
+    // Store transaction
+    await transactionStore.put(
+      'auth_txn:' + transactionId,
+      transaction,
+      10 * 60, // 10 minutes TTL
+    );
+
+    // OIDC Core 1.0 Section 3.1.2.1: prompt is a space-delimited list
+    const promptValues = transaction.prompt?.trim().split(/\\s+/).filter(Boolean) ?? [];
+
+    // prompt=none must not be combined with other values (OIDC Core 1.0 Section 3.1.2.1)
+    if (promptValues.includes('none') && promptValues.length > 1) {
+      await transactionStore.delete('auth_txn:' + transactionId);
+      return c.redirect(buildErrorRedirect(transaction.redirectUri, 'invalid_request', transaction.state, 'prompt=none must not be combined with other prompt values', issuer));
+    }
+
+    // prompt=none: silent authentication without any user interaction
+    // OIDC Core 1.0 Section 3.1.2.1
+    if (promptValues.includes('none')) {
+      const sessionResolver = c.get('sessionResolver');
+      const consentResolver = c.get('consentResolver');
+
+      // No sessionResolver configured → cannot verify session → login_required
+      if (!sessionResolver) {
+        await transactionStore.delete('auth_txn:' + transactionId);
+        return c.redirect(buildErrorRedirect(transaction.redirectUri, 'login_required', transaction.state, 'sessionResolver is not configured; cannot satisfy prompt=none', issuer));
+      }
+
+      // No consentResolver configured → cannot confirm consent → consent_required
+      // (OIDC Core 1.0 Section 3.1.2.1: prompt=none must not display consent screen)
+      if (!consentResolver) {
+        await transactionStore.delete('auth_txn:' + transactionId);
+        return c.redirect(buildErrorRedirect(transaction.redirectUri, 'consent_required', transaction.state, 'consentResolver is not configured; cannot satisfy prompt=none', issuer));
+      }
+
+      // OIDC Core 1.0 §3.1.2.1: when id_token_hint is provided, the OP MUST verify
+      // its signature, iss, aud, and exp before trusting sub. The verified subject
+      // is then matched against the active session (handled by checkPromptNone).
+      // OP の JWKS を提供するための jwksProvider を context から取得する。
+      let verifiedHintSubject: string | undefined;
+      if (transaction.idTokenHint !== undefined) {
+        const jwksProvider = c.get('jwksProvider') as undefined | (() => Promise<JwkSet> | JwkSet);
+        if (!jwksProvider) {
+          // jwksProvider 未提供では hint を検証できない → login_required で拒否
+          await transactionStore.delete('auth_txn:' + transactionId);
+          return c.redirect(buildErrorRedirect(transaction.redirectUri, 'login_required', transaction.state, 'jwksProvider is not configured; cannot verify id_token_hint', issuer));
+        }
+        try {
+          const jwks = await jwksProvider();
+          const verified = await validateIdTokenHint(transaction.idTokenHint, {
+            expectedIss: issuer,
+            expectedAud: transaction.clientId,
+            jwks,
+          });
+          verifiedHintSubject = verified.sub;
+        } catch (hintError) {
+          await transactionStore.delete('auth_txn:' + transactionId);
+          const code = hintError instanceof IdTokenHintError ? hintError.error : 'login_required';
+          return c.redirect(buildErrorRedirect(transaction.redirectUri, code, transaction.state, hintError instanceof Error && hintError.message ? hintError.message : 'id_token_hint verification failed', issuer));
+        }
+      }
+
+      let session;
+      try {
+        // checkPromptNone validates session AND consent in one shot.
+        // Throws AuthorizationError(login_required | consent_required) on failure.
+        session = await checkPromptNone(transaction, sessionResolver, c.req.raw, consentResolver, {
+          verifiedHintSubject,
+        });
+      } catch (promptError) {
+        await transactionStore.delete('auth_txn:' + transactionId);
+        if (promptError instanceof AuthorizationError) {
+          return c.redirect(buildErrorRedirect(transaction.redirectUri, promptError.error, transaction.state, promptError.errorDescription, issuer));
+        }
+        const serverDescription =
+          promptError instanceof Error && promptError.message
+            ? promptError.message
+            : 'Unexpected error while evaluating prompt=none';
+        return c.redirect(buildErrorRedirect(transaction.redirectUri, 'server_error', transaction.state, serverDescription, issuer));
+      }
+
+      // Check max_age: if session is too old, prompt=none cannot trigger re-authentication
+      // OIDC Core 1.0 Section 3.1.2.1
+      if (transaction.maxAge !== undefined && requiresReauthentication(transaction.maxAge, session.authTime)) {
+        await transactionStore.delete('auth_txn:' + transactionId);
+        return c.redirect(buildErrorRedirect(transaction.redirectUri, 'login_required', transaction.state, 'Session exceeds the requested max_age; re-authentication required', issuer));
+      }
+
+      // Filter offline_access if the client does not allow it
+      const clientConfig = await clientResolver.findClient(transaction.clientId);
+      const grantedScope = transaction.scope.split(' ').filter((s: string) => {
+        if (s === 'offline_access' && !clientConfig?.offlineAccessAllowed) return false;
+        return Boolean(s);
+      });
+
+      // Generate authorization code via core helper
+      const responseParams = await completeAuthTransaction(
+        transactionId,
+        transaction,
+        transactionStore,
+      );
+      const authCodeData = await createAuthorizationCode({
+        authorizationResponse: { ...responseParams, scope: grantedScope },
+        subject: session.subject,
+        authTime: session.authTime,
+        // OIDC Core 1.0 §3.1.3.1: TTL は ProviderConfig から設定可能（既定 300 秒）。
+        ttlSeconds: config.authorizationCodeTtl,
+      });
+      await authCodeStore.set(authCodeData.code, authCodeData);
+      await consentResolver.recordGrant?.(
+        session.subject,
+        transaction.clientId,
+        authCodeData.grantId,
+      );
+
+      const redirectUrl = new URL(transaction.redirectUri);
+      redirectUrl.searchParams.set('code', authCodeData.code);
+      if (transaction.state) redirectUrl.searchParams.set('state', transaction.state);
+      // RFC 9207 §2: include iss in success responses too.
+      redirectUrl.searchParams.set('iss', issuer);
+      return c.redirect(redirectUrl.toString());
+    }
+
+    // OIDC Core 1.0 Section 3.1.2.3: an active OP session enables Single Sign-On.
+    // Reuse it (skipping the login screen) unless prompt forces fresh auth.
+    // - When max_age is requested, the session must also satisfy the freshness
+    //   bound (Section 3.1.2.1).
+    // - When max_age is absent, any active session is reused (SSO).
+    // prompt=login / prompt=select_account always force re-authentication.
+    if (!promptValues.includes('login') && !promptValues.includes('select_account')) {
+      const sessionResolver = c.get('sessionResolver');
+      if (sessionResolver) {
+        const existingSession = await sessionResolver.resolve(c.req.raw);
+        const sessionIsFresh =
+          existingSession !== null &&
+          (transaction.maxAge === undefined ||
+            !requiresReauthentication(transaction.maxAge, existingSession.authTime));
+        if (existingSession && sessionIsFresh) {
+          // OIDC Core 1.0 §3.1.2.1: prompt=consent MUST re-display the consent UI.
+          // Otherwise, if the user already granted (a superset of) the requested
+          // scopes to this client, skip the consent screen and issue the code
+          // directly — the interactive analogue of the prompt=none silent path.
+          const consentResolver = c.get('consentResolver');
+          const requestedScopes = transaction.scope.split(' ').filter(Boolean);
+          const consentAlreadyGranted =
+            !promptValues.includes('consent') &&
+            consentResolver !== undefined &&
+            (await consentResolver.hasConsent(
+              existingSession.subject,
+              transaction.clientId,
+              requestedScopes,
+            ));
+
+          if (consentAlreadyGranted) {
+            // Filter offline_access if the client does not allow it
+            const clientConfig = await clientResolver.findClient(transaction.clientId);
+            const grantedScope = transaction.scope.split(' ').filter((s: string) => {
+              if (s === 'offline_access' && !clientConfig?.offlineAccessAllowed) return false;
+              return Boolean(s);
+            });
+
+            const responseParams = await completeAuthTransaction(
+              transactionId,
+              transaction,
+              transactionStore,
+            );
+            const authCodeData = await createAuthorizationCode({
+              authorizationResponse: { ...responseParams, scope: grantedScope },
+              subject: existingSession.subject,
+              authTime: existingSession.authTime,
+              // OIDC Core 1.0 §3.1.3.1: TTL は ProviderConfig から設定可能（既定 300 秒）。
+              ttlSeconds: config.authorizationCodeTtl,
+            });
+            await authCodeStore.set(authCodeData.code, authCodeData);
+            await consentResolver.recordGrant?.(
+              existingSession.subject,
+              transaction.clientId,
+              authCodeData.grantId,
+            );
+
+            const redirectUrl = new URL(transaction.redirectUri);
+            redirectUrl.searchParams.set('code', authCodeData.code);
+            if (transaction.state) redirectUrl.searchParams.set('state', transaction.state);
+            // RFC 9207 §2: include iss in success responses.
+            redirectUrl.searchParams.set('iss', issuer);
+            return c.redirect(redirectUrl.toString());
+          }
+
+          const authSessionStore = c.get('authSessionStore') ?? defaultAuthSessionStore;
+          await authSessionStore.set(transactionId, {
+            subject: existingSession.subject,
+            authTime: existingSession.authTime,
+          });
+          const consentUrl = new URL('/consent', c.req.url);
+          consentUrl.searchParams.set('transaction_id', transactionId);
+          return c.redirect(consentUrl.toString());
+        }
+      }
+    }
+
+    // Redirect to login page (prompt=login forces re-authentication; handled in login route)
+    const loginUrl = new URL('/login', c.req.url);
+    loginUrl.searchParams.set('transaction_id', transactionId);
+    return c.redirect(loginUrl.toString());
+  } catch (error) {
+    if (error instanceof AuthorizationError) {
+      if (error.redirectUri) {
+        const redirectUrl = new URL(error.redirectUri);
+        redirectUrl.searchParams.set('error', error.error);
+        if (error.errorDescription) {
+          redirectUrl.searchParams.set('error_description', error.errorDescription);
+        }
+        if (error.state) {
+          redirectUrl.searchParams.set('state', error.state);
+        }
+        // RFC 9207 §2: include iss on error redirects so the client can
+        // pin the issuer. config has already been read into context by
+        // middleware; reread it here because the early-bound issuer is
+        // scoped to the try block.
+        redirectUrl.searchParams.set('iss', c.get('config').issuer);
+        return c.redirect(redirectUrl.toString());
+      }
+      // OIDC Core 1.0 §3.1.2.2: errors that cannot be redirected (unknown
+      // client_id, unregistered redirect_uri, redirect_uri with a fragment) MUST
+      // NOT redirect to the supplied redirect_uri. Browser callers get an HTML
+      // error page (so the OIDF Conformance Suite can submit a screenshot for
+      // oidcc-ensure-registered-redirect-uri); programmatic callers that ask for
+      // JSON via the Accept header still receive the OAuth error JSON.
+      const acceptsJson = (c.req.header('Accept') ?? '').includes('application/json');
+      if (acceptsJson) {
+        return c.json({ error: error.error, error_description: error.errorDescription }, 400);
+      }
+      // OP 内部のエラーページパスが設定されている場合（Next.js sample のように
+      // error.tsx などの framework-native なエラー画面へ委ねたいケース）は、HTML を
+      // 直接返さず 303 でそのパスへ遷移する。未登録 redirect_uri へは決して飛ばさず、
+      // OP 自身のパスにのみ遷移する。遷移先ページは 200 を返すため元の HTTP 400 は
+      // 失われるが、ブラウザにエラー画面を見せる（OIDF の screenshot 要件）目的は満たす。
+      // error / error_description は URLSearchParams でエンコードして渡す。
+      // 安全性のため遷移先は OP 内部の root-relative path（'/' 始まりかつ
+      // protocol-relative '//host' でない）に限定する。絶対 URL や '//host' を
+      // 設定された場合は open redirect 化を防ぐため redirect せず、安全側の
+      // HTML error page にフォールバックする。
+      const errorPagePath = c.get('config').authorizationErrorRedirectPath;
+      if (errorPagePath && errorPagePath.startsWith('/') && !errorPagePath.startsWith('//')) {
+        const params = new URLSearchParams({ error: error.error });
+        if (error.errorDescription) {
+          params.set('error_description', error.errorDescription);
+        }
+        return c.redirect(\`\${errorPagePath}?\${params.toString()}\`, 303);
+      }
+      const views = c.get('views') ?? defaultViews;
+      return renderView(
+        views.errorPage({
+          error: error.error,
+          errorDescription: error.errorDescription,
+          statusCode: 400,
+        }),
+        { status: 400 },
+      );
+    }
+    return c.json({ error: 'server_error' }, 500);
+  }
+};
+
+// OIDC Core 1.0 Section 3.1.2.1: Authorization Endpoint must support both GET and POST.
+authorizeApp.get('/', handleAuthorizationRequest);
+authorizeApp.post('/', handleAuthorizationRequest);
+`;
+}
+
+export function tokenRouteTemplate(
+  corePkg: string,
+  features: OidcFeatureConfig = DEFAULT_FEATURES,
+): string {
+  const refreshResolverImport = features.refreshToken
+    ? `
+  refreshTokenResolver as defaultRefreshTokenResolver,`
+    : '';
+  const refreshStoreImport = features.refreshToken
+    ? `
+  refreshTokenStore as defaultRefreshTokenStore,`
+    : '';
+  const refreshResolverConst = features.refreshToken
+    ? `    const refreshTokenResolver =
+      c.get('refreshTokenResolver') ?? defaultRefreshTokenResolver;
+`
+    : '';
+  const refreshStoreConst = features.refreshToken
+    ? `    const refreshTokenStore = c.get('refreshTokenStore') ?? defaultRefreshTokenStore;
+`
+    : '';
+  const validateTokenGrantOptions = features.refreshToken
+    ? `      refreshTokenResolver,
+`
+    : `      // The refresh_token feature is disabled: the OP only offers the
+      // authorization_code grant, so refresh_token requests are rejected with
+      // unsupported_grant_type (RFC 6749 §5.2).
+      supportedGrantTypes: ['authorization_code'],
+`;
+  const grantHasOfflineAccessBlock = features.refreshToken
+    ? `    // RFC 6749 §6 / OIDC Core 1.0 §11: refresh 時の scope 縮小は当該リクエストの access token /
+    // ID Token の権限縮小として扱い、refresh token rotation の可否とは切り離す。rotation 可否は
+    // 「元の grant が offline_access を持っていたか」で判断する。
+    // - authorization_code grant: 今回付与された scope に offline_access があるか。
+    // - refresh_token grant: 元 refresh token の grant が offline_access を持っていたか
+    //   (validatedRequest.hadOfflineAccess)。縮小後 scope から offline_access を落としても
+    //   元 grant の権限は失われないため rotation を継続する。
+    const grantHasOfflineAccess =
+      validatedRequest.grantType === 'refresh_token'
+        ? validatedRequest.hadOfflineAccess
+        : validatedRequest.scope.includes('offline_access');
+
+`
+    : '';
+  const issueRefreshTokenOption = features.refreshToken
+    ? `      issueRefreshToken: grantHasOfflineAccess,
+`
+    : `      // The refresh_token feature is disabled: never issue a refresh token.
+      issueRefreshToken: false,
+`;
+  // resolvedAcr / resolvedAmr are only persisted into the refresh token record,
+  // so the destructuring must shrink with the feature to keep noUnusedLocals green.
+  const tokenResponseDestructure = features.refreshToken
+    ? `const { response: tokenResponse, resolvedAcr, resolvedAmr } = await generateTokenResponse({`
+    : `const { response: tokenResponse } = await generateTokenResponse({`;
+  const refreshTokenPersistenceBlock = features.refreshToken
+    ? `    // Store the new refresh token for rotation (OAuth 2.1 Section 4.3.1).
+    // The same grantId / audience / authTime / nonce / acr / amr / azp is propagated through
+    // rotations so descendants can be revoked on code reuse, the audience never expands,
+    // and refresh で再発行する ID Token は OIDC Core 1.0 §12.1 に従い初回認証時の値を保持する。
+    if (tokenResponse.refresh_token) {
+      // authTime はここで必ず確定する: authorization_code 経由は authCode.authTime、
+      // refresh_token 経由は validatedRequest.authTime（前段で代入済み）。
+      const rtAuthTime = authTime;
+      if (rtAuthTime === undefined) {
+        throw new TokenError(
+          TokenErrorCode.InvalidGrant,
+          'authTime is required to issue a refresh token',
+        );
+      }
+      // OAuth 2.1 §6.1: refresh token は initial issuance からの absolute lifetime のみで失効する。
+      // rotation を跨いで originalIssuedAt を引き継ぎ、expiresAt はそこからの絶対的な期限で固定する。
+      // sliding expiry は持たないため、リフレッシュを繰り返しても失効時刻は前に進まず、
+      // 漏洩 RT の長期 abuse を防ぐ。
+      // - authorization_code grant: 今回が初回発行なので originalIssuedAt = issuedAt。
+      // - refresh_token grant: 元 RT の originalIssuedAt をそのまま引き継ぐ。
+      const originalIssuedAt =
+        validatedRequest.grantType === 'refresh_token'
+          ? validatedRequest.originalIssuedAt
+          : issuedAt;
+      const refreshTokenExpiresAt = originalIssuedAt + config.refreshTokenAbsoluteLifetime;
+      // RFC 6749 §6: 縮小後 scope（validatedRequest.scope）から offline_access が落ちても、
+      // grant が offline_access を持つ限り次回以降の rotation を継続できるよう、永続化する
+      // refresh token の scope には offline_access を保持する。access token は
+      // validatedRequest.scope をそのまま使うため、当該リクエストの権限は縮小されたままになる。
+      const refreshTokenScope =
+        grantHasOfflineAccess && !validatedRequest.scope.includes('offline_access')
+          ? [...validatedRequest.scope, 'offline_access']
+          : validatedRequest.scope;
+      await refreshTokenStore.set(tokenResponse.refresh_token, {
+        subject,
+        clientId: validatedRequest.clientId,
+        scope: refreshTokenScope,
+        expiresAt: refreshTokenExpiresAt,
+        originalIssuedAt,
+        used: false,
+        grantId: validatedRequest.grantId,
+        iat: issuedAt,
+        issuer: config.issuer,
+        audience: effectiveAudience,
+        authTime: rtAuthTime,
+        nonce,
+        // OIDC Core 1.0 §12.1: refresh で再発行する ID Token は初回認証時の acr / amr を保持する。
+        // - authorization_code grant: 直前で resolver が解決した値をそのまま永続化する。
+        // - refresh_token grant: 既に保存済みの値を引き継ぐ（resolver は呼ばれていない）。
+        acr: validatedRequest.grantType === 'refresh_token' ? validatedRequest.acr : resolvedAcr,
+        amr: validatedRequest.grantType === 'refresh_token' ? validatedRequest.amr : resolvedAmr,
+        azp: validatedRequest.grantType === 'refresh_token' ? validatedRequest.azp : undefined,
+      });
+    }
+
+    // OAuth 2.1 Section 4.3.1: ローテーションは新トークン保存成功後に旧 RT を失効する。
+    // 失敗時にユーザーがリフレッシュ不能になることを防ぐため、必ずこの順序にする。
+    if (validatedRequest.grantType === 'refresh_token' && params.refresh_token) {
+      await refreshTokenResolver.revokeRefreshToken(params.refresh_token);
+    }
+
+`
+    : '';
+  return `import { Hono } from 'hono';
+import {
+  validateTokenRequest,
+  generateTokenResponse,
+  buildAccessTokenAudience,
+  authenticateClient,
+  createJwtAccessTokenIssuer,
+  createOpaqueAccessTokenIssuer,
+  selectSigningKeyByAlg,
+  TokenError,
+  TokenErrorCode,
+  type AccessTokenIssuer,
+  type AcrResolver,
+  type SigningKey,
+  type TokenRequestParams,
+} from '${corePkg}';
+import {
+  tokenClientResolver as defaultTokenClientResolver,
+  authorizationCodeResolver as defaultAuthorizationCodeResolver,${refreshResolverImport}
+} from '../resolvers.js';
+import {
+  accessTokenStore as defaultAccessTokenStore,
+  authCodeStore as defaultAuthCodeStore,${refreshStoreImport}
+} from '../store.js';
+import type { RegisteredClient } from '../config.js';
+
+export const tokenApp = new Hono<{ Variables: Record<string, any> }>();
+
+/**
+ * Narrows raw body params to the typed TokenRequestParams.
+ * Returns false when the required grant_type field is absent.
+ */
+function isTokenRequestParams(
+  params: unknown,
+): params is TokenRequestParams {
+  if (typeof params !== 'object' || params === null) return false;
+  const p = params as Record<string, unknown>;
+  return typeof p['grant_type'] === 'string';
+}
+
+/**
+ * Returns true when the Content-Type names application/x-www-form-urlencoded.
+ * RFC 6749 §4.1.3 / Appendix B / OIDC Core 1.0 §3.1.3.1: the Token Request
+ * entity-body MUST be application/x-www-form-urlencoded. Media types are
+ * case-insensitive (RFC 9110 §8.3.1) and may carry parameters such as
+ * "; charset=UTF-8", so we lowercase and strip everything after the first ';'.
+ */
+function isFormUrlEncoded(contentType: string): boolean {
+  const [mediaType = ''] = contentType.toLowerCase().split(';');
+  return mediaType.trim() === 'application/x-www-form-urlencoded';
+}
+
+/**
+ * Token Endpoint
+ * OIDC Core 1.0 Section 3.1.3
+ */
+tokenApp.post('/', async (c) => {
+  // RFC 6749 §4.1.3 / OIDC Core 1.0 §3.1.3.1: reject any body that is not
+  // application/x-www-form-urlencoded (e.g. multipart/form-data, application/json)
+  // before parsing so a non-form payload is never consumed as token parameters.
+  const contentType = c.req.header('Content-Type') ?? '';
+  if (!isFormUrlEncoded(contentType)) {
+    // RFC 6749 Section 5.2: error responses MUST set Cache-Control: no-store / Pragma: no-cache.
+    c.header('Cache-Control', 'no-store');
+    c.header('Pragma', 'no-cache');
+    return c.json({ error: 'invalid_request', error_description: 'Token requests must use application/x-www-form-urlencoded' }, 400);
+  }
+
+  // RFC 6749 §3.2: token endpoint request parameters MUST NOT be repeated.
+  // Read the raw form body so URLSearchParams iteration exposes duplicate keys
+  // instead of letting parseBody silently keep only the last value.
+  const rawBody = await c.req.text();
+  const searchParams = new URLSearchParams(rawBody);
+  const rawParams: Record<string, string> = {};
+  const seen = new Set<string>();
+  let duplicateKey: string | undefined;
+  for (const [key, value] of searchParams) {
+    if (seen.has(key)) {
+      duplicateKey = key;
+      break;
+    }
+    seen.add(key);
+    rawParams[key] = value;
+  }
+  const authorization = c.req.header('Authorization') ?? '';
+
+  if (duplicateKey !== undefined) {
+    // RFC 6749 Section 5.2: error responses MUST set Cache-Control: no-store / Pragma: no-cache.
+    c.header('Cache-Control', 'no-store');
+    c.header('Pragma', 'no-cache');
+    return c.json({ error: 'invalid_request', error_description: \`Parameter "\${duplicateKey}" must not be repeated\` }, 400);
+  }
+
+  if (!isTokenRequestParams(rawParams)) {
+    // RFC 6749 Section 5.2: error responses MUST set Cache-Control: no-store / Pragma: no-cache.
+    c.header('Cache-Control', 'no-store');
+    c.header('Pragma', 'no-cache');
+    return c.json({ error: 'invalid_request', error_description: 'Missing required parameter: grant_type' }, 400);
+  }
+
+  const params = rawParams;
+
+  try {
+    const tokenClientResolver = c.get('tokenClientResolver') ?? defaultTokenClientResolver;
+    const authorizationCodeResolver =
+      c.get('authCodeResolver') ?? defaultAuthorizationCodeResolver;
+${refreshResolverConst}    const authCodeStore = c.get('authCodeStore') ?? defaultAuthCodeStore;
+    const accessTokenStore = c.get('accessTokenStore') ?? defaultAccessTokenStore;
+${refreshStoreConst}
+    // OAuth 2.1 Section 2.3 / OIDC Core 1.0 Section 9: client_secret_basic / client_secret_post
+    const authenticatedClientId = await authenticateClient({
+      params,
+      authorizationHeader: authorization,
+      clientResolver: tokenClientResolver,
+    });
+
+    const validatedRequest = await validateTokenRequest({
+      params,
+      clientResolver: tokenClientResolver,
+      authCodeResolver: authorizationCodeResolver,
+      authenticatedClientId,
+${validateTokenGrantOptions}    });
+
+    const config = c.get('config');
+    const privateKey = c.get('privateKey');
+    const keyId = c.get('keyId');
+
+    // T-022: pick an ID Token signing key whose alg matches the client's
+    // id_token_signed_response_alg (OIDC Dynamic Client Registration §2).
+    // - 未指定クライアントは OIDC 仕様デフォルトの RS256 で扱う。
+    // - alg に合う鍵が登録されていなければサーバ設定エラー (server_error)。
+    const idTokenSigningKeys = (c.get('idTokenSigningKeys') as SigningKey[] | undefined) ?? [];
+    const fallbackIdKey: SigningKey | undefined =
+      c.get('idTokenPrivateKey') !== undefined
+        ? {
+            privateKey: c.get('idTokenPrivateKey'),
+            publicJwk: c.get('idTokenPublicJwk'),
+            keyId: c.get('idTokenKeyId') ?? keyId,
+          }
+        : undefined;
+    const registeredClient = (await tokenClientResolver.findClient(authenticatedClientId)) as
+      | RegisteredClient
+      | null;
+    const requestedIdTokenAlg = registeredClient?.idTokenSignedResponseAlg;
+    let selectedIdTokenKey: SigningKey;
+    if (idTokenSigningKeys.length > 0) {
+      try {
+        selectedIdTokenKey = selectSigningKeyByAlg(idTokenSigningKeys, requestedIdTokenAlg);
+      } catch {
+        return c.json(
+          {
+            error: 'server_error',
+            error_description: \`No ID Token signing key registered for alg "\${requestedIdTokenAlg ?? 'RS256'}"\`,
+          },
+          500,
+        );
+      }
+    } else if (fallbackIdKey) {
+      selectedIdTokenKey = fallbackIdKey;
+    } else {
+      return c.json({ error: 'server_error', error_description: 'No ID Token signing key registered' }, 500);
+    }
+    const idTokenPrivateKey = selectedIdTokenKey.privateKey;
+    const idTokenKeyId = selectedIdTokenKey.keyId;
+
+    let subject: string;
+    let authTime: number | undefined;
+    let nonce: string | undefined;
+
+    if (validatedRequest.grantType === 'authorization_code') {
+      const authCode = await authCodeStore.get(validatedRequest.code);
+      if (!authCode?.subject || !authCode.authTime) {
+        throw new TokenError(
+          TokenErrorCode.InvalidGrant,
+          'Authorization code missing required subject context',
+        );
+      }
+      subject = authCode.subject;
+      authTime = authCode.authTime;
+      nonce = validatedRequest.nonce;
+    } else {
+      // refresh_token grant
+      // OIDC Core 1.0 §12.2: the re-issued ID Token retains iss/sub/aud/exp/iat/
+      // auth_time/azp/acr/amr — nonce is NOT in that list. nonce binds an
+      // Authentication Request to its ID Token (§2); a refresh has no such request,
+      // so carrying the old nonce adds no replay protection. Major OPs (Google,
+      // Auth0) omit it on refresh, so we omit it here by default. auth_time is
+      // still preserved per §12.1.
+      subject = validatedRequest.subject;
+      authTime = validatedRequest.authTime;
+      nonce = undefined;
+    }
+
+    // Choose access token issuer based on config (default: JWT).
+    // Opaque tokens are recommended when immediate revocation is required,
+    // since the resource server can call the introspection endpoint instead
+    // of self-validating a JWT.
+    const accessTokenIssuer: AccessTokenIssuer =
+      config.accessTokenFormat === 'opaque'
+        ? createOpaqueAccessTokenIssuer()
+        : createJwtAccessTokenIssuer();
+
+    // アクセストークンの audience を決定する（合成ポリシーは core の buildAccessTokenAudience に集約）。
+    // RFC 9068 §3: JWT access token の aud は非空でなければならない。
+    // このアクセストークンは常に OP 自身の UserInfo エンドポイントで使用できるため、UserInfo
+    // エンドポイント（discovery が広告する userinfo_endpoint と同じ URL）を aud の恒久メンバとして
+    // 必ず含める。resource 指定（validatedRequest.audience）があれば末尾に追加し、UserInfo
+    // エンドポイントを取り除くことはしない。重複は除去される。
+    // refresh では保存済み aud（既に UserInfo を含む）を引き継ぐため、再計算しても同一集合になる。
+    const effectiveAudience = buildAccessTokenAudience({
+      userInfoEndpoint: \`\${config.issuer}/userinfo\`,
+      requested: validatedRequest.audience,
+      issuer: config.issuer,
+    });
+
+    // T-015: acr / amr resolver injection.
+    // - authorization_code: pass acrResolver so the host app can decide acr / amr policy.
+    // - refresh_token: pass stored acr / amr directly so OIDC Core 1.0 §12.1 SHOULD
+    //   "preserve initial auth context" is satisfied; resolver is bypassed.
+    const acrResolver = c.get('acrResolver') as AcrResolver | undefined;
+    const directAcr = validatedRequest.grantType === 'refresh_token' ? validatedRequest.acr : undefined;
+    const directAmr = validatedRequest.grantType === 'refresh_token' ? validatedRequest.amr : undefined;
+
+${grantHasOfflineAccessBlock}    ${tokenResponseDestructure}
+      issuer: config.issuer,
+      subject,
+      clientId: validatedRequest.clientId,
+      scope: validatedRequest.scope,
+      privateKey,
+      keyId,
+      idTokenPrivateKey,
+      idTokenKeyId,
+      accessTokenExpiresIn: config.accessTokenExpiresIn,
+      idTokenExpiresIn: config.idTokenExpiresIn,
+      nonce,
+      authTime,
+      audience: effectiveAudience,
+${issueRefreshTokenOption}      accessTokenIssuer,
+      // OIDC Core 1.0 §12: refresh_token grant でも id_token は MAY。
+      // openid scope を持つ場合は §12.1 に従い初回認証時と同じ auth_time / nonce / acr / amr / azp で再発行する。
+      issueIdToken: validatedRequest.scope.includes('openid'),
+      acrResolver: validatedRequest.grantType === 'authorization_code' ? acrResolver : undefined,
+      acr: directAcr,
+      amr: directAmr,
+      // OIDC Core 1.0 §3.1.2.1: forward the requested acr_values so the AcrResolver can
+      // honor them. refresh_token grant preserves the stored acr / amr instead (§12.1),
+      // so requestedAcrValues is only passed on the authorization_code grant.
+      requestedAcrValues:
+        validatedRequest.grantType === 'authorization_code' ? validatedRequest.acrValues : undefined,
+      // OIDC Core 1.0 §5.5: forward the parsed claims request so the ID Token can
+      // satisfy id_token member requests (e.g. acr.values).
+      claims: validatedRequest.grantType === 'authorization_code' ? validatedRequest.claims : undefined,
+    });
+
+    const issuedAt = Math.floor(Date.now() / 1000);
+
+    // Store access token info for UserInfo / Introspection / Revocation endpoints.
+    // iat / nbf / audience / issuer are kept so RFC 7662 introspection can echo them.
+    // grantId binds this token to the original authorization grant so it can be
+    // revoked together with sibling tokens on code reuse (OAuth 2.1 Section 4.1.2).
+    await accessTokenStore.set(tokenResponse.access_token, {
+      sub: subject,
+      clientId: validatedRequest.clientId,
+      scope: validatedRequest.scope,
+      expiresAt: issuedAt + config.accessTokenExpiresIn,
+      grantId: validatedRequest.grantId,
+      iat: issuedAt,
+      // RFC 7519 §4.1.5 / RFC 7662 §2.2: persist nbf (= iat) for JWT and opaque
+      // tokens alike so introspection reports a not-yet-valid token inactive and
+      // can echo nbf. The JWT issuer emits the same nbf = iat inside the token.
+      nbf: issuedAt,
+      audience: effectiveAudience,
+      issuer: config.issuer,
+      // OIDC Core 1.0 §5.5: persist the authorization request's claims parameter
+      // so the UserInfo endpoint can honor claims.userinfo members (e.g.
+      // {"userinfo":{"name":{"essential":true}}}) independently of scope.
+      claims: validatedRequest.grantType === 'authorization_code' ? validatedRequest.claims : undefined,
+    });
+
+${refreshTokenPersistenceBlock}    c.header('Cache-Control', 'no-store');
+    c.header('Pragma', 'no-cache');
+    return c.json(tokenResponse);
+  } catch (error) {
+    if (error instanceof TokenError) {
+      const status = error.statusCode as 400 | 401;
+      // RFC 6750 Section 3 / OAuth 2.1 Section 5.2: 401 responses include WWW-Authenticate
+      if (error.wwwAuthenticate) {
+        c.header('WWW-Authenticate', error.wwwAuthenticate);
+      }
+      // RFC 6749 Section 5.2: error responses MUST set Cache-Control: no-store / Pragma: no-cache.
+      c.header('Cache-Control', 'no-store');
+      c.header('Pragma', 'no-cache');
+      return c.json(
+        { error: error.error, error_description: error.errorDescription },
+        status,
+      );
+    }
+    // RFC 6749 Section 5.2: server_error responses MUST NOT be cached either.
+    c.header('Cache-Control', 'no-store');
+    c.header('Pragma', 'no-cache');
+    return c.json({ error: 'server_error' }, 500);
+  }
+});
+`;
+}
+
+export function userinfoRouteTemplate(corePkg: string): string {
+  return `import { Hono } from 'hono';
+import {
+  handleUserInfoRequest,
+  generateUserInfoJwt,
+  selectSigningKeyByAlg,
+  UserInfoError,
+  type SigningKey,
+} from '${corePkg}';
+import {
+  accessTokenResolver as defaultAccessTokenResolver,
+  userClaimsResolver as defaultUserClaimsResolver,
+  clientResolver as defaultClientResolver,
+} from '../resolvers.js';
+import type { RegisteredClient } from '../config.js';
+
+export const userinfoApp = new Hono<{ Variables: Record<string, any> }>();
+
+/**
+ * Extract the access token from the request, supporting:
+ * - Authorization: Bearer header (RFC 6750 Section 2.1, REQUIRED)
+ * - access_token form body parameter on POST (RFC 6750 Section 2.2, OPTIONAL)
+ *
+ * Per RFC 6750 Section 2, clients MUST NOT use more than one method per request.
+ * URL query parameter (Section 2.3) is intentionally NOT supported (OAuth 2.1 prohibits it).
+ */
+async function extractAccessToken(c: any): Promise<{ token: string; methodCount: number }> {
+  const authHeader = c.req.header('Authorization') ?? '';
+  // RFC 7235 Section 2.1: HTTP authentication scheme is case-insensitive.
+  // Match the "Bearer" scheme case-insensitively but preserve the token value verbatim.
+  const bearerSpaceIndex = authHeader.indexOf(' ');
+  const headerToken =
+    bearerSpaceIndex !== -1 &&
+    authHeader.slice(0, bearerSpaceIndex).toLowerCase() === 'bearer'
+      ? authHeader.slice(bearerSpaceIndex + 1)
+      : '';
+
+  let bodyToken = '';
+  if (c.req.method === 'POST') {
+    const contentType = c.req.header('Content-Type') ?? '';
+    const mediaType = contentType.toLowerCase().split(';')[0]?.trim() ?? '';
+    if (mediaType === 'application/x-www-form-urlencoded') {
+      // Parse the form payload ourselves after media-type normalization. Hono's
+      // parseBody() dispatch is case-sensitive for some Content-Type spellings.
+      const body = Object.fromEntries(new URLSearchParams(await c.req.text()));
+      const candidate = body['access_token'];
+      if (typeof candidate === 'string') {
+        bodyToken = candidate;
+      }
+    }
+  }
+
+  const methodCount = (headerToken ? 1 : 0) + (bodyToken ? 1 : 0);
+  return { token: headerToken || bodyToken, methodCount };
+}
+
+/**
+ * UserInfo Endpoint
+ * OIDC Core 1.0 Section 5.3
+ *
+ * Response format is selected by the client metadata \`userinfo_signed_response_alg\`:
+ * - When present (e.g. 'RS256'), respond as a signed JWT with content-type application/jwt
+ *   (OIDC Core 1.0 Section 5.3.2).
+ * - When absent, respond as application/json.
+ */
+const handler = async (c: any) => {
+  // RFC 6750 Section 5.2 / OIDC Core 1.0 Section 16.4:
+  // UserInfo responses (success and error) expose PII and must not be cached
+  // by intermediaries. Set the no-cache headers once up-front so every branch
+  // below inherits them.
+  c.header('Cache-Control', 'no-store');
+  c.header('Pragma', 'no-cache');
+
+  let accessToken: string;
+  try {
+    const { token, methodCount } = await extractAccessToken(c);
+    if (methodCount > 1) {
+      // RFC 6750 Section 2: clients MUST NOT use more than one method per request.
+      c.header('WWW-Authenticate', 'Bearer realm="UserInfo", error="invalid_request"');
+      return c.json(
+        {
+          error: 'invalid_request',
+          error_description: 'Multiple access token methods are not allowed',
+        },
+        400,
+      );
+    }
+    accessToken = token;
+    if (!accessToken) {
+      // RFC 6750 §3.1: when the request has no authentication information, the
+      // challenge omits error/error_description and only identifies the realm.
+      c.header('WWW-Authenticate', 'Bearer realm="UserInfo"');
+      return c.json(
+        { error: 'invalid_token', error_description: 'Access token is required' },
+        401,
+      );
+    }
+  } catch {
+    return c.json({ error: 'invalid_request' }, 400);
+  }
+
+  try {
+    const accessTokenResolver =
+      c.get('accessTokenResolver') ?? defaultAccessTokenResolver;
+    const userClaimsResolver =
+      c.get('userClaimsResolver') ?? defaultUserClaimsResolver;
+    const clientResolver = c.get('clientResolver') ?? defaultClientResolver;
+
+    // Resolve the token first so the stored claims parameter (OIDC Core 1.0 §5.5)
+    // can be forwarded to handleUserInfoRequest; reused below for the client lookup.
+    const tokenInfo = await accessTokenResolver.findAccessToken(accessToken);
+
+    const response = await handleUserInfoRequest({
+      accessToken,
+      accessTokenResolver,
+      userClaimsResolver,
+      claimsParameter: tokenInfo?.claims,
+      // RFC 9068 §4: validate that this UserInfo endpoint is in the access token's aud.
+      // The token endpoint always stores the UserInfo endpoint URL in aud (buildAccessTokenAudience),
+      // so passing it here turns audience validation on by default for both JWT and opaque tokens.
+      expectedAudience: \`\${c.get('config').issuer}/userinfo\`,
+    });
+
+    const client = tokenInfo
+      ? ((await clientResolver.findClient(tokenInfo.clientId)) as RegisteredClient | null)
+      : null;
+
+    const requestedUserinfoAlg = client?.userinfoSignedResponseAlg;
+    if (requestedUserinfoAlg) {
+      // OIDC Core 1.0 §5.3.2: when the client registered userinfo_signed_response_alg,
+      // the UserInfo Response MUST be a JWS signed with THAT alg (RS256, ES256, ...),
+      // not unconditionally RS256. Pick a registered UserInfo signing key whose alg
+      // matches the request — mirroring the ID Token key selection. The per-purpose
+      // userinfoSigningKeys set is preferred; otherwise fall back to a single
+      // configured key kept as ONE unit so its kid stays paired with its private key.
+      // The fallback key is alg-checked too, so a request whose alg has no matching
+      // key is a server configuration error (never silently signed with another alg).
+      const config = c.get('config');
+      const userinfoSigningKeys = (c.get('userinfoSigningKeys') as SigningKey[] | undefined) ?? [];
+      const fallbackUserinfoKey: SigningKey | undefined =
+        c.get('userinfoPrivateKey') !== undefined
+          ? {
+              privateKey: c.get('userinfoPrivateKey'),
+              publicJwk: c.get('userinfoPublicJwk'),
+              keyId: c.get('userinfoKeyId'),
+            }
+          : c.get('privateKey') !== undefined
+            ? {
+                privateKey: c.get('privateKey'),
+                publicJwk: c.get('publicJwk'),
+                keyId: c.get('keyId'),
+              }
+            : undefined;
+      const candidateUserinfoKeys =
+        userinfoSigningKeys.length > 0
+          ? userinfoSigningKeys
+          : fallbackUserinfoKey
+            ? [fallbackUserinfoKey]
+            : [];
+      if (candidateUserinfoKeys.length === 0) {
+        return c.json(
+          { error: 'server_error', error_description: 'No UserInfo signing key registered' },
+          500,
+        );
+      }
+      let selectedUserinfoKey: SigningKey;
+      try {
+        selectedUserinfoKey = selectSigningKeyByAlg(candidateUserinfoKeys, requestedUserinfoAlg);
+      } catch {
+        return c.json(
+          {
+            error: 'server_error',
+            error_description: \`No UserInfo signing key registered for alg "\${requestedUserinfoAlg}"\`,
+          },
+          500,
+        );
+      }
+      const jwt = await generateUserInfoJwt(response, {
+        issuer: config.issuer,
+        audience: client.clientId,
+        privateKey: selectedUserinfoKey.privateKey,
+        keyId: selectedUserinfoKey.keyId,
+      });
+      c.header('Content-Type', 'application/jwt');
+      return c.body(jwt);
+    }
+
+    return c.json(response);
+  } catch (error) {
+    if (error instanceof UserInfoError) {
+      const status = error.statusCode as 401 | 403;
+      c.header(
+        'WWW-Authenticate',
+        \`Bearer realm="UserInfo", error="\${error.error}", error_description="\${error.errorDescription}"\`,
+      );
+      return c.json(
+        { error: error.error, error_description: error.errorDescription },
+        status,
+      );
+    }
+    return c.json({ error: 'server_error' }, 500);
+  }
+};
+
+userinfoApp.get('/', handler);
+userinfoApp.post('/', handler);
+`;
+}
+
+export function jwksRouteTemplate(corePkg: string): string {
+  return `import { Hono } from 'hono';
+import { exportJwks, extractAlgorithmParamsFromJwk, type SigningKey } from '${corePkg}';
+
+export const jwksApp = new Hono<{ Variables: Record<string, any> }>();
+
+/**
+ * JWKS Endpoint
+ * Serves the public keys used to verify token signatures.
+ *
+ * T-022: per-purpose key arrays (signingKeys / idTokenSigningKeys / userinfoSigningKeys)
+ * are flattened and exposed so rotated-out keys remain verifiable until tokens
+ * signed with them expire. kid 指定がある鍵は kid で重複排除し、kid 未指定の
+ * 鍵は最新（最後に投入された）1 件のみ採用する。
+ */
+jwksApp.get('/', async (c) => {
+  // 旧 single-key context をフォールバックとして温存することで、createApp 経路や
+  // 一部だけ手書きされた route も従来どおり動く。
+  const signingKeys = (c.get('signingKeys') as SigningKey[] | undefined) ?? [];
+  const idTokenSigningKeys = (c.get('idTokenSigningKeys') as SigningKey[] | undefined) ?? [];
+  const userinfoSigningKeys = (c.get('userinfoSigningKeys') as SigningKey[] | undefined) ?? [];
+
+  const candidates: { jwk: JsonWebKey; kid: string | undefined }[] = [];
+  const pushAll = (keys: SigningKey[]) => {
+    for (const k of keys) {
+      candidates.push({ jwk: k.publicJwk as JsonWebKey, kid: k.keyId });
+    }
+  };
+  if (signingKeys.length > 0) {
+    pushAll(signingKeys);
+  } else {
+    const publicJwk = c.get('publicJwk');
+    const keyId = c.get('keyId');
+    if (publicJwk) {
+      candidates.push({ jwk: publicJwk, kid: keyId });
+    }
+  }
+  if (idTokenSigningKeys.length > 0) {
+    pushAll(idTokenSigningKeys);
+  } else {
+    const idTokenPublicJwk = c.get('idTokenPublicJwk');
+    const idTokenKeyId = c.get('idTokenKeyId');
+    if (idTokenPublicJwk) {
+      candidates.push({ jwk: idTokenPublicJwk, kid: idTokenKeyId });
+    }
+  }
+  if (userinfoSigningKeys.length > 0) {
+    pushAll(userinfoSigningKeys);
+  } else {
+    const userinfoPublicJwk = c.get('userinfoPublicJwk');
+    const userinfoKeyId = c.get('userinfoKeyId');
+    if (userinfoPublicJwk) {
+      candidates.push({ jwk: userinfoPublicJwk, kid: userinfoKeyId });
+    }
+  }
+
+  if (candidates.length === 0) {
+    return c.json({ error: 'server_error' }, 500);
+  }
+
+  // kid 指定がある鍵は最初に出現したものを採用（重複排除）。
+  // kid 未指定の鍵は最後に投入された 1 件のみ採用（最新性を優先）。
+  const seenKids = new Set<string>();
+  let lastUndefinedIndex = -1;
+  for (let i = 0; i < candidates.length; i++) {
+    if (candidates[i]!.kid === undefined) lastUndefinedIndex = i;
+  }
+
+  const entries: { publicKey: CryptoKey; keyId?: string }[] = [];
+  for (let i = 0; i < candidates.length; i++) {
+    const { jwk, kid } = candidates[i]!;
+    if (kid === undefined) {
+      if (i !== lastUndefinedIndex) continue;
+    } else {
+      if (seenKids.has(kid)) continue;
+      seenKids.add(kid);
+    }
+    const algParams = extractAlgorithmParamsFromJwk(jwk);
+    const publicKey = await crypto.subtle.importKey(
+      'jwk',
+      jwk,
+      algParams,
+      true,
+      ['verify'],
+    );
+    entries.push({ publicKey, keyId: kid });
+  }
+
+  const jwks = await exportJwks(entries);
+
+  c.header('Cache-Control', 'public, max-age=3600');
+  return c.json(jwks);
+});
+`;
+}
+
+export function discoveryRouteTemplate(
+  corePkg: string,
+  features: OidcFeatureConfig = DEFAULT_FEATURES,
+): string {
+  const scopesSupportedEntry = features.refreshToken
+    ? `    // OIDC Core 1.0 §11: offline_access is advertised so relying parties (and the
+    // OIDF Conformance Suite's oidcc-refresh-token module) know they may request
+    // refresh tokens via 'scope=openid offline_access' with prompt=consent.
+    // It is a refresh-token request scope, not a claim scope, so no matching
+    // entry is added to claimsSupported.
+    scopesSupported: ['openid', 'profile', 'email', 'address', 'phone', 'offline_access'],
+`
+    : `    // The refresh_token feature is disabled, so offline_access is not advertised
+    // (OIDC Core 1.0 §11: it would never be granted by this provider).
+    scopesSupported: ['openid', 'profile', 'email', 'address', 'phone'],
+`;
+  const grantTypesSupportedEntry = features.refreshToken
+    ? `    grantTypesSupported: ['authorization_code', 'refresh_token'],
+`
+    : `    grantTypesSupported: ['authorization_code'],
+`;
+  const requestObjectMetadata = features.requestObject
+    ? `    // OIDC Core 1.0 §6.1 / OIDC Discovery 1.0 §3: signed Request Object by value is
+    // supported (verified against the client's registered JWKS). request_uri (§6.2)
+    // is not supported, so it is explicitly advertised as false (Discovery defaults
+    // request_uri_parameter_supported to true when omitted). RS256 is the required
+    // signing alg; 'none' is added only when unsigned objects are accepted for
+    // Basic OP conformance compatibility.
+    requestParameterSupported: true,
+    requestUriParameterSupported: false,
+    requestObjectSigningAlgValuesSupported: config.allowUnsignedRequestObject
+      ? ['RS256', 'none']
+      : ['RS256'],
+`
+    : `    // OIDC Core 1.0 §6.3: the request parameter (Request Object) is disabled in
+    // this generated provider, so request_parameter_supported is advertised as
+    // false. request_uri (§6.2) remains unsupported as well.
+    requestParameterSupported: false,
+    requestUriParameterSupported: false,
+`;
+  const rfc8414Comment =
+    features.introspection && features.revocation
+      ? `    // RFC 8414 — both endpoints require confidential client authentication.
+`
+      : features.introspection || features.revocation
+        ? `    // RFC 8414 — the endpoint requires confidential client authentication.
+`
+        : '';
+  const introspectionMetadata = features.introspection
+    ? `    introspectionEndpoint: \`\${issuer}/introspect\`,
+    introspectionEndpointAuthMethodsSupported: [
+      'client_secret_basic',
+      'client_secret_post',
+    ],
+`
+    : '';
+  const revocationMetadata = features.revocation
+    ? `    revocationEndpoint: \`\${issuer}/revoke\`,
+    revocationEndpointAuthMethodsSupported: [
+      'client_secret_basic',
+      'client_secret_post',
+    ],
+`
+    : '';
+  return `import { Hono } from 'hono';
+import { buildProviderMetadata, getJwaAlgorithm, type SigningKey } from '${corePkg}';
+import { defaultProviderConfig } from '../config.js';
+
+export const discoveryApp = new Hono<{ Variables: Record<string, any> }>();
+
+/**
+ * OpenID Connect Discovery Endpoint
+ * OIDC Discovery 1.0 Section 4
+ */
+discoveryApp.get('/', (c) => {
+  const config = c.get('config') ?? defaultProviderConfig;
+  const issuer = config.issuer;
+
+  // Derive id_token_signing_alg_values_supported from the actual key set
+  // (OIDC Core 1.0 §15.1 — RS256 presence is enforced by buildProviderMetadata).
+  // T-022: 全 registered ID Token 鍵の alg を集約することで RS256+ES256 など
+  // 混在鍵セットも正しく advertise できる。フォールバックは旧 single-key context。
+  const idTokenSigningKeyArr = (c.get('idTokenSigningKeys') as SigningKey[] | undefined) ?? [];
+  const idTokenSigningKeys: CryptoKey[] = idTokenSigningKeyArr.length > 0
+    ? idTokenSigningKeyArr.map((k) => k.privateKey)
+    : (c.get('idTokenPrivateKey') ?? c.get('privateKey'))
+      ? [c.get('idTokenPrivateKey') ?? c.get('privateKey')]
+      : [];
+
+  // OIDC Core 1.0 §5.3.2 / §3 discovery: advertise the UserInfo signing algs the OP
+  // can actually sign with, derived from the registered UserInfo key set (RS256,
+  // ES256, ...), so userinfo_signed_response_alg clients can rely on metadata.
+  // Defaults to ['RS256'] when no per-purpose key set is wired into context.
+  const userinfoSigningKeyArr = (c.get('userinfoSigningKeys') as SigningKey[] | undefined) ?? [];
+  const userinfoSigningAlgValues = userinfoSigningKeyArr.length > 0
+    ? [...new Set(userinfoSigningKeyArr.map((k) => getJwaAlgorithm(k.privateKey)))]
+    : ['RS256'];
+
+  const metadata = buildProviderMetadata({
+    issuer,
+    authorizationEndpoint: \`\${issuer}/authorize\`,
+    tokenEndpoint: \`\${issuer}/token\`,
+    jwksUri: \`\${issuer}/.well-known/jwks.json\`,
+    responseTypesSupported: ['code'],
+    // OAuth 2.0 Multiple Response Type Encoding Practices §2 / OIDC Discovery 1.0 §3:
+    // the OP only implements the authorization code flow, whose authorization
+    // response is returned via query, so response_modes_supported is pinned to
+    // ['query']. Extend this list when form_post (or other modes) are added.
+    responseModesSupported: ['query'],
+    subjectTypesSupported: ['public'],
+    idTokenSigningKeys,
+    userinfoEndpoint: \`\${issuer}/userinfo\`,
+${scopesSupportedEntry}    // OIDC Discovery 1.0 §3 / Core 1.0 §5.6: this OP produces Normal Claims only
+    // (no _claim_names / _claim_sources), so advertise ['normal'] explicitly to make
+    // the lack of Aggregated/Distributed support machine-readable.
+    claimTypesSupported: ['normal'],
+    claimsSupported: [
+      'sub',
+      'iss',
+      'aud',
+      'exp',
+      'iat',
+      // OIDC Core 1.0 §2 / §3.1.3.6: ID Token protocol claims the OP issues
+      // (id-token.ts). auth_time/nonce/acr/amr are set from the auth context,
+      // azp for multi-audience tokens, at_hash for code flow access tokens.
+      // c_hash is intentionally omitted (Hybrid flow is not implemented).
+      'auth_time',
+      'nonce',
+      'acr',
+      'amr',
+      'azp',
+      'at_hash',
+      'name',
+      'family_name',
+      'given_name',
+      'middle_name',
+      'nickname',
+      'preferred_username',
+      'profile',
+      'picture',
+      'website',
+      'gender',
+      'birthdate',
+      'zoneinfo',
+      'locale',
+      'updated_at',
+      'email',
+      'email_verified',
+      'address',
+      'phone_number',
+      'phone_number_verified',
+    ],
+${grantTypesSupportedEntry}    // RFC 6749 §2.1 / OAuth 2.1 §2.4: 'none' advertises that public clients
+    // (no client_secret) are accepted at the token endpoint.
+    tokenEndpointAuthMethodsSupported: [
+      'client_secret_basic',
+      'client_secret_post',
+      'none',
+    ],
+    // Required when any client uses userinfo_signed_response_alg
+    // (OIDC Core 1.0 Section 5.3.2). Derived from the registered UserInfo key set so
+    // ES256 (and other) algs are advertised once a matching key is configured.
+    userinfoSigningAlgValuesSupported: userinfoSigningAlgValues,
+${requestObjectMetadata}    // OIDC Discovery 1.0 §3 / Core 1.0 §5.5: the 'claims' request parameter is
+    // implemented for both the ID Token and UserInfo paths, so it is advertised
+    // as supported. Without this (defaults to false) spec-compliant RPs would
+    // never send the 'claims' parameter.
+    claimsParameterSupported: true,
+    // RFC 9207 §3: authorize endpoint adds iss to all authorization responses.
+    authorizationResponseIssParameterSupported: true,
+${rfc8414Comment}${introspectionMetadata}${revocationMetadata}  });
+
+  // RFC 8414 §3.2 / RFC 9111 §5.2: Discovery metadata is cacheable. Advertise a
+  // 3600s freshness lifetime, symmetric with the JWKS endpoint (jwks.ts), so
+  // client libraries reuse the metadata deterministically.
+  c.header('Cache-Control', 'public, max-age=3600');
+  // code_challenge_methods_supported is defined in OAuth 2.1 / PKCE spec,
+  // not in OIDC Discovery, so it is added separately.
+  return c.json({
+    ...metadata,
+    code_challenge_methods_supported: ['S256'],
+  });
+});
+`;
+}
+
+export function loginRouteTemplate(corePkg: string): string {
+  return `import { Hono } from 'hono';
+import {
+  getAuthTransaction,
+  validateCsrfToken,
+  handleLoginFailure,
+  generateRandomString,
+} from '${corePkg}';
+import {
+  transactionStore as defaultTransactionStore,
+  authSessionStore as defaultAuthSessionStore,
+  browserSessionStore as defaultBrowserSessionStore,
+  buildSessionCookie,
+  parseSessionId,
+  userStore,
+} from '../store.js';
+import { defaultViews, renderView } from '../views.js';
+
+export const loginApp = new Hono<{ Variables: Record<string, any> }>();
+
+/**
+ * Login Page - GET
+ * Displays the login form for user authentication.
+ */
+loginApp.get('/', async (c) => {
+  const transactionId = c.req.query('transaction_id');
+  if (!transactionId) {
+    return c.text('Missing transaction_id', 400);
+  }
+
+  const views = c.get('views') ?? defaultViews;
+  const transactionStore = c.get('transactionStore') ?? defaultTransactionStore;
+  const transaction = await getAuthTransaction(transactionId, transactionStore);
+
+  return renderView(views.loginPage({
+    transactionId,
+    csrfToken: transaction.csrfToken,
+    // OIDC Core 1.0 §3.1.2.1: pre-fill the login form with login_hint (RECOMMENDED).
+    loginHint: transaction.loginHint,
+  }));
+});
+
+/**
+ * Login Handler - POST
+ * Processes the login form submission.
+ */
+loginApp.post('/', async (c) => {
+  const body = await c.req.parseBody();
+  const transactionId = String(body['transaction_id'] ?? '');
+  const csrfToken = String(body['csrf_token'] ?? '');
+  const username = String(body['username'] ?? '');
+  const password = String(body['password'] ?? '');
+
+  const views = c.get('views') ?? defaultViews;
+  const transactionStore = c.get('transactionStore') ?? defaultTransactionStore;
+  const authSessionStore = c.get('authSessionStore') ?? defaultAuthSessionStore;
+  const browserSessionStore = c.get('browserSessionStore') ?? defaultBrowserSessionStore;
+  const authenticateUser =
+    c.get('authenticateUser') ??
+    ((u: string, p: string) => userStore.authenticate(u, p));
+
+  const transaction = await getAuthTransaction(transactionId, transactionStore);
+  validateCsrfToken(transaction, csrfToken);
+
+  // Authenticate user
+  const user = await authenticateUser(username, password);
+  if (!user) {
+    const failureResult = await handleLoginFailure(
+      transactionId,
+      transaction,
+      transactionStore,
+    );
+    if (!failureResult.canRetry) {
+      return renderView(views.errorPage({
+        error: 'Too many login attempts',
+        statusCode: 429,
+      }), { status: 429 });
+    }
+    return renderView(views.loginPage({
+      transactionId,
+      csrfToken: transaction.csrfToken,
+      error: 'Invalid credentials',
+      remainingAttempts: failureResult.maxAttempts - failureResult.failedAttempts,
+      loginHint: transaction.loginHint,
+    }));
+  }
+
+  // prompt=login (and prompt=select_account in Phase 1) requires fresh
+  // authentication: discard any existing transaction handoff AND browser session.
+  // OIDC Core 1.0 Section 3.1.2.1 — prompt is a space-delimited list, use includes()
+  const loginPromptValues = transaction.prompt?.trim().split(/\\s+/).filter(Boolean) ?? [];
+  if (loginPromptValues.includes('login') || loginPromptValues.includes('select_account')) {
+    await authSessionStore.delete(transactionId);
+    const existingSessionId = parseSessionId(c.req.header('Cookie') ?? null);
+    if (existingSessionId) browserSessionStore.delete(existingSessionId);
+  }
+
+  const authTime = Math.floor(Date.now() / 1000);
+
+  // Store authenticated subject for the consent step (per-transaction handoff).
+  await authSessionStore.set(transactionId, {
+    subject: user.sub,
+    authTime,
+  });
+
+  // Establish a persistent browser (OP) session and set the session cookie so
+  // SSO / prompt=none / max_age work on subsequent authorization requests
+  // (OIDC Core 1.0 Section 3.1.2.3).
+  const sessionId = await generateRandomString(32);
+  browserSessionStore.set(sessionId, { subject: user.sub, authTime });
+  c.header('Set-Cookie', buildSessionCookie(sessionId));
+
+  // Redirect to consent page
+  const consentUrl = new URL('/consent', c.req.url);
+  consentUrl.searchParams.set('transaction_id', transactionId);
+  return c.redirect(consentUrl.toString());
+});
+`;
+}
+
+export function consentRouteTemplate(corePkg: string): string {
+  return `import { Hono } from 'hono';
+import {
+  getAuthTransaction,
+  validateCsrfToken,
+  completeAuthTransaction,
+  createAuthorizationCode,
+} from '${corePkg}';
+import {
+  clientResolver as defaultClientResolver,
+  consentResolver as defaultConsentResolver,
+} from '../resolvers.js';
+import {
+  transactionStore as defaultTransactionStore,
+  authCodeStore as defaultAuthCodeStore,
+  authSessionStore as defaultAuthSessionStore,
+} from '../store.js';
+import { defaultViews, renderView } from '../views.js';
+
+export const consentApp = new Hono<{ Variables: Record<string, any> }>();
+
+/**
+ * Consent Page - GET
+ * Displays the consent form for scope authorization.
+ */
+consentApp.get('/', async (c) => {
+  const transactionId = c.req.query('transaction_id');
+  if (!transactionId) {
+    return c.text('Missing transaction_id', 400);
+  }
+
+  const views = c.get('views') ?? defaultViews;
+  const transactionStore = c.get('transactionStore') ?? defaultTransactionStore;
+  const transaction = await getAuthTransaction(transactionId, transactionStore);
+
+  return renderView(views.consentPage({
+    transactionId,
+    csrfToken: transaction.csrfToken,
+    scopes: transaction.scope.split(' ').filter(Boolean),
+    clientId: transaction.clientId,
+  }));
+});
+
+/**
+ * Consent Handler - POST
+ * Processes the consent decision.
+ */
+consentApp.post('/', async (c) => {
+  const body = await c.req.parseBody();
+  const transactionId = String(body['transaction_id'] ?? '');
+  const csrfToken = String(body['csrf_token'] ?? '');
+  const action = String(body['action'] ?? '');
+
+  const views = c.get('views') ?? defaultViews;
+  const transactionStore = c.get('transactionStore') ?? defaultTransactionStore;
+  const authCodeStore = c.get('authCodeStore') ?? defaultAuthCodeStore;
+  const authSessionStore = c.get('authSessionStore') ?? defaultAuthSessionStore;
+  const clientResolver = c.get('clientResolver') ?? defaultClientResolver;
+
+  const transaction = await getAuthTransaction(transactionId, transactionStore);
+  validateCsrfToken(transaction, csrfToken);
+
+  // RFC 9207 §2: include the issuer identifier on every authorization response
+  // (success and error) so clients can pin the issuer that produced the response.
+  const config = c.get('config');
+  const issuer = config.issuer;
+
+  if (action === 'deny') {
+    const redirectUrl = new URL(transaction.redirectUri);
+    redirectUrl.searchParams.set('error', 'access_denied');
+    if (transaction.state) {
+      redirectUrl.searchParams.set('state', transaction.state);
+    }
+    redirectUrl.searchParams.set('iss', issuer);
+    await transactionStore.delete('auth_txn:' + transactionId);
+    await authSessionStore.delete(transactionId);
+    return c.redirect(redirectUrl.toString());
+  }
+
+  const session = await authSessionStore.get(transactionId);
+  if (!session) {
+    return renderView(views.errorPage({
+      error: 'Authentication session not found. Please restart login.',
+      statusCode: 400,
+    }), { status: 400 });
+  }
+
+  const responseParams = await completeAuthTransaction(
+    transactionId,
+    transaction,
+    transactionStore,
+  );
+
+  // Filter offline_access if the client does not allow it
+  const clientConfig = await clientResolver.findClient(transaction.clientId);
+  const grantedScope = transaction.scope.split(' ').filter((s) => {
+    if (s === 'offline_access' && !clientConfig?.offlineAccessAllowed) return false;
+    return Boolean(s);
+  });
+
+  // Generate authorization code via core helper
+  // OIDC Core 1.0 Section 3.1.3.1: TTL is configurable via ProviderConfig
+  // (defaults to 300 seconds — 5 minutes).
+  const authCodeData = await createAuthorizationCode({
+    authorizationResponse: { ...responseParams, scope: grantedScope },
+    subject: session.subject,
+    authTime: session.authTime,
+    ttlSeconds: config.authorizationCodeTtl,
+  });
+  await authCodeStore.set(authCodeData.code, authCodeData);
+
+  // Record consent so a later prompt=none (or non-interactive SSO) request can
+  // confirm it without UI (OIDC Core 1.0 Section 3.1.2.1 / 3.1.2.4). Routed
+  // through the consentResolver so a custom store can override persistence.
+  // Only the per-transaction handoff is cleared below; the browser (OP) session
+  // persists so SSO keeps working.
+  const consentResolver = c.get('consentResolver') ?? defaultConsentResolver;
+  await consentResolver.recordConsent?.(session.subject, transaction.clientId, grantedScope);
+  await consentResolver.recordGrant?.(
+    session.subject,
+    transaction.clientId,
+    authCodeData.grantId,
+  );
+
+  await authSessionStore.delete(transactionId);
+
+  // Redirect back to client with authorization code
+  const redirectUrl = new URL(responseParams.redirectUri);
+  redirectUrl.searchParams.set('code', authCodeData.code);
+  if (responseParams.state) {
+    redirectUrl.searchParams.set('state', responseParams.state);
+  }
+  redirectUrl.searchParams.set('iss', issuer);
+  return c.redirect(redirectUrl.toString());
+});
+`;
+}
+
+export function applyTemplate(
+  _corePkg: string,
+  features: OidcFeatureConfig = DEFAULT_FEATURES,
+): string {
+  const introspectionImport = features.introspection
+    ? `import { introspectionApp } from './routes/introspection.js';\n`
+    : '';
+  const revocationImport = features.revocation
+    ? `import { revocationApp } from './routes/revocation.js';\n`
+    : '';
+  const introspectionCors = features.introspection
+    ? `  app.use('/introspect', protectedCors);\n`
+    : '';
+  const revocationCors = features.revocation
+    ? `  app.use('/revoke', protectedCors);\n`
+    : '';
+  const introspectionMount = features.introspection
+    ? `  app.route('/introspect', introspectionApp);\n`
+    : '';
+  const revocationMount = features.revocation
+    ? `  app.route('/revoke', revocationApp);\n`
+    : '';
+  const methodGuard = oidcMethodGuardTemplate(features);
+  return `import type { Hono } from 'hono';
+import { cors } from 'hono/cors';
+import { authorizeApp } from './routes/authorize.js';
+import { tokenApp } from './routes/token.js';
+import { userinfoApp } from './routes/userinfo.js';
+${introspectionImport}${revocationImport}import { jwksApp } from './routes/jwks.js';
+import { discoveryApp } from './routes/discovery.js';
+import { loginApp } from './routes/login.js';
+import { consentApp } from './routes/consent.js';
+import {
+  createInMemoryClientResolver,
+  createProviderConfig,
+  type ProviderConfig,
+} from './config.js';
+import {
+  sessionResolver as defaultSessionResolver,
+  consentResolver as defaultConsentResolver,
+} from './resolvers.js';
+import { createViews, type Views } from './views.js';
+import {
+  assertHasRs256Key,
+  assertKeyStrength,
+  assertKidStrategyConsistent,
+  getRegisteredSigningKeys,
+  signingKeysToJwkSet,
+} from '${_corePkg}';
+import type {
+  SigningKey,
+  SigningKeyProvider,
+  ClientResolver,
+  TokenClientResolver,
+  AcrResolver,
+  JwkSet,
+  SessionResolver,
+  ConsentResolver,
+} from '${_corePkg}';
+
+/**
+ * CORS の許可 origin。
+ * - '*' (デフォルト) または string / string[]: cors() の origin オプションに直接渡される
+ * - browser-based クライアントで Authorization ヘッダや form body を使う場合は許可必須 (OAuth 2.1 §4.2)
+ */
+export type CorsOrigins = string | string[];
+
+export interface ApplyOidcOptions {
+  config?: Partial<ProviderConfig>;
+  /**
+   * Primary signing key provider. Used for the access token (JWT format) and
+   * as the fallback for ID Token / UserInfo signing when their dedicated
+   * providers are not configured. Must load keys from your secret store
+   * (env var, KV, D1, etc.).
+   * Use createCachedSigningKeyProvider() to refresh the key periodically.
+   */
+  signingKeyProvider: SigningKeyProvider;
+  /**
+   * Optional ID Token signing key provider.
+   * If omitted, signingKeyProvider is used.
+   * Useful when id_token_signed_response_alg differs from the access token
+   * algorithm, or when you want to rotate ID Token keys independently.
+   */
+  idTokenSigningKeyProvider?: SigningKeyProvider;
+  /**
+   * Optional UserInfo JWT signing key provider.
+   * If omitted, signingKeyProvider is used.
+   * Useful when userinfo_signed_response_alg differs from other signing keys
+   * (OIDC Core 1.0 Section 5.3.2).
+   */
+  userinfoSigningKeyProvider?: SigningKeyProvider;
+  clientResolver?: ClientResolver;
+  tokenClientResolver?: TokenClientResolver;
+  /**
+   * Session resolver used for SSO / prompt=none / max_age
+   * (OIDC Core 1.0 Section 3.1.2.1 / 3.1.2.3).
+   * Defaults to the cookie-based browser session resolver in resolvers.ts.
+   */
+  sessionResolver?: SessionResolver;
+  /**
+   * Consent resolver used by prompt=none to confirm prior consent without UI
+   * (OIDC Core 1.0 Section 3.1.2.1).
+   * Defaults to the in-memory consent store resolver in resolvers.ts.
+   */
+  consentResolver?: ConsentResolver;
+  /**
+   * acr / amr resolver (OIDC Core 1.0 §2 / §12.1).
+   * Host application が認証ポリシーに合わせて acr / amr を返す。
+   * 未指定の場合 ID Token に acr / amr クレームは含まれない（T-009 hold 相当）。
+   */
+  acrResolver?: AcrResolver;
+  /**
+   * id_token_hint 検証用に OP の JWKS を返すプロバイダ。
+   * authorize エンドポイントで id_token_hint パラメータを受け取った場合、
+   * その JWT の署名を検証するために使用される (OIDC Core 1.0 §3.1.2.1)。
+   * 未指定の場合、id_token_hint を含む prompt=none 認可リクエストは
+   * login_required で拒否される。
+   */
+  jwksProvider?: () => Promise<JwkSet> | JwkSet;
+  /**
+   * CORS で許可する origin。
+   * - 未指定: '*' (=ワイルドカード)
+   * - 文字列または配列: そのまま hono/cors の origin に渡す
+   *
+   * Token / UserInfo / Introspection / Revocation エンドポイントに適用される。
+   * Discovery / JWKS は仕様上常に '*' 固定 (OIDC Discovery / RFC 8414 で公開資産扱い)。
+   */
+  corsOrigins?: CorsOrigins;
+  /**
+   * Custom UI for the login / consent / error pages.
+   * Provide any subset; omitted pages fall back to the default views.
+   * Inject your own UI here instead of editing views.ts.
+   */
+  views?: Partial<Views>;
+}
+
+export function validateSigningKeySet(
+  keys: readonly SigningKey[],
+  requireRs256 = false,
+): void {
+  assertKeyStrength(keys);
+  assertKidStrategyConsistent(keys);
+  if (requireRs256) {
+    assertHasRs256Key(keys.map((key) => key.privateKey));
+  }
+}
+
+${methodGuard}
+
+/**
+ * Apply the OpenID Connect Provider routes and middleware to an existing Hono app.
+ * Call this function to add OIDC provider functionality to your application.
+ *
+ * @example
+ * import { Hono } from 'hono';
+ * import { applyOidc } from './oidc-provider/apply.js';
+ *
+ * const app = new Hono();
+ * app.get('/', (c) => c.text('Hello World'));
+ * applyOidc(app, { signingKeyProvider: yourProvider });
+ */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export function applyOidc(app: Hono<any>, options: ApplyOidcOptions): void {
+  // CORS middleware (OAuth 2.1 §4.2): browser-based client が Token/UserInfo/Introspect/Revoke
+  // を呼べるように Access-Control-Allow-Origin を返す。preflight (OPTIONS) も自動で処理される。
+  // Discovery / JWKS は常に '*' (公開資産)。
+  const corsOrigins = options.corsOrigins ?? '*';
+  const protectedCors = cors({
+    origin: corsOrigins,
+    allowMethods: ['POST', 'GET', 'OPTIONS'],
+    allowHeaders: ['Authorization', 'Content-Type'],
+    maxAge: 600,
+  });
+  const publicCors = cors({
+    origin: '*',
+    allowMethods: ['GET', 'OPTIONS'],
+    maxAge: 600,
+  });
+  app.use('/token', protectedCors);
+  app.use('/userinfo', protectedCors);
+${introspectionCors}${revocationCors}  app.use('/.well-known/openid-configuration', publicCors);
+  app.use('/.well-known/jwks.json', publicCors);
+  // CORS must run first so OPTIONS preflights are answered before method enforcement.
+  app.use('*', enforceOidcEndpointMethod);
+
+  // Store runtime dependencies for use by route handlers.
+  app.use('*', async (c, next) => {
+    let signingKey;
+    let idTokenSigningKey;
+    let userinfoSigningKey;
+    // T-022: registered key sets (current + rotated-out + alg variants).
+    // Each provider's getSigningKeys() drives JWKS / Discovery; getSigningKey()
+    // drives "the active key for new signatures." A provider that does not
+    // implement getSigningKeys gets a single-element fallback automatically.
+    let signingKeys;
+    let idTokenSigningKeys;
+    let userinfoSigningKeys;
+    try {
+      signingKey = await options.signingKeyProvider.getSigningKey();
+      signingKeys = await getRegisteredSigningKeys(options.signingKeyProvider);
+      // Each purpose-specific provider falls back to the primary signing key.
+      const idProvider = options.idTokenSigningKeyProvider ?? options.signingKeyProvider;
+      idTokenSigningKey = await idProvider.getSigningKey();
+      idTokenSigningKeys = await getRegisteredSigningKeys(idProvider);
+      const uiProvider = options.userinfoSigningKeyProvider ?? options.signingKeyProvider;
+      userinfoSigningKey = await uiProvider.getSigningKey();
+      userinfoSigningKeys = await getRegisteredSigningKeys(uiProvider);
+      validateSigningKeySet(signingKeys);
+      validateSigningKeySet(idTokenSigningKeys, true);
+      validateSigningKeySet(userinfoSigningKeys);
+    } catch {
+      return c.json({ error: 'server_error', error_description: 'Failed to load signing key' }, 503);
+    }
+    const { privateKey, publicJwk, keyId } = signingKey;
+    const clientResolver =
+      options.clientResolver ?? createInMemoryClientResolver();
+
+    // Backward-compatible aliases (primary key) — used by jwks/token routes that
+    // still read these context vars.
+    c.set('privateKey', privateKey);
+    c.set('publicJwk', publicJwk);
+    c.set('keyId', keyId);
+    // Purpose-specific active keys
+    c.set('idTokenPrivateKey', idTokenSigningKey.privateKey);
+    c.set('idTokenPublicJwk', idTokenSigningKey.publicJwk);
+    c.set('idTokenKeyId', idTokenSigningKey.keyId);
+    c.set('userinfoPrivateKey', userinfoSigningKey.privateKey);
+    c.set('userinfoPublicJwk', userinfoSigningKey.publicJwk);
+    c.set('userinfoKeyId', userinfoSigningKey.keyId);
+    // T-022: registered key sets per purpose.
+    c.set('signingKeys', signingKeys);
+    c.set('idTokenSigningKeys', idTokenSigningKeys);
+    c.set('userinfoSigningKeys', userinfoSigningKeys);
+
+    c.set('config', createProviderConfig(options.config));
+    c.set('clientResolver', clientResolver);
+    c.set('tokenClientResolver', options.tokenClientResolver ?? clientResolver);
+    // T-015: acr / amr resolver (optional; undefined preserves T-009 hold behavior).
+    if (options.acrResolver) {
+      c.set('acrResolver', options.acrResolver);
+    }
+    // T-017 / P1: id_token_hint 検証用 JWKS プロバイダ。未指定なら OP 自身の
+    // ID Token 署名鍵セットを既定として使い、OP が発行した ID Token を hint として
+    // 検証できるようにする（OIDC Core 1.0 §3.1.2.2）。明示指定があれば優先。
+    c.set('jwksProvider', options.jwksProvider ?? (() => signingKeysToJwkSet(idTokenSigningKeys)));
+    // P1: default cookie-based session + consent resolvers so prompt=none /
+    // max_age / SSO work out of the box (OIDC Core 1.0 Section 3.1.2.1 / 3.1.2.3).
+    c.set('sessionResolver', options.sessionResolver ?? defaultSessionResolver);
+    c.set('consentResolver', options.consentResolver ?? defaultConsentResolver);
+    // Inject custom UI (login / consent / error) merged over the defaults.
+    c.set('views', createViews(options.views));
+    await next();
+  });
+
+  app.route('/authorize', authorizeApp);
+  app.route('/token', tokenApp);
+  app.route('/userinfo', userinfoApp);
+${introspectionMount}${revocationMount}  app.route('/.well-known/jwks.json', jwksApp);
+  app.route('/.well-known/openid-configuration', discoveryApp);
+  app.route('/login', loginApp);
+  app.route('/consent', consentApp);
+}
+`;
+}
+
+export function introspectionRouteTemplate(corePkg: string): string {
+  return `import { Hono } from 'hono';
+import {
+  authenticateClient,
+  handleIntrospectionRequest,
+  IntrospectionError,
+  TokenError,
+} from '${corePkg}';
+import {
+  tokenClientResolver as defaultTokenClientResolver,
+  introspectionAccessTokenResolver as defaultAccessResolver,
+  introspectionRefreshTokenResolver as defaultRefreshResolver,
+} from '../resolvers.js';
+
+export const introspectionApp = new Hono<{ Variables: Record<string, any> }>();
+
+function isFormUrlEncoded(contentType: string): boolean {
+  return contentType.toLowerCase().split(';')[0]?.trim() === 'application/x-www-form-urlencoded';
+}
+
+/**
+ * Token Introspection Endpoint
+ * RFC 7662 Section 2
+ *
+ * Confidential client only — public clients are out of scope for this template.
+ * Response is always cache-busting per RFC 7662 Section 2.2.
+ */
+introspectionApp.post('/', async (c) => {
+  c.header('Cache-Control', 'no-store');
+  c.header('Pragma', 'no-cache');
+
+  if (!isFormUrlEncoded(c.req.header('Content-Type') ?? '')) {
+    return c.json(
+      {
+        error: 'invalid_request',
+        error_description: 'Content-Type must be application/x-www-form-urlencoded',
+      },
+      400,
+    );
+  }
+
+  const body = Object.fromEntries(new URLSearchParams(await c.req.text()));
+  const authorization = c.req.header('Authorization') ?? '';
+  const params = Object.fromEntries(
+    Object.entries(body).map(([k, v]) => [k, String(v)]),
+  );
+
+  try {
+    const tokenClientResolver = c.get('tokenClientResolver') ?? defaultTokenClientResolver;
+    const accessTokenResolver =
+      c.get('introspectionAccessTokenResolver') ?? defaultAccessResolver;
+    const refreshTokenResolver =
+      c.get('introspectionRefreshTokenResolver') ?? defaultRefreshResolver;
+
+    const authenticatedClientId = await authenticateClient({
+      params,
+      authorizationHeader: authorization,
+      clientResolver: tokenClientResolver,
+    });
+
+    const response = await handleIntrospectionRequest({
+      params: {
+        token: typeof params.token === 'string' ? params.token : undefined,
+        token_type_hint:
+          typeof params.token_type_hint === 'string' ? params.token_type_hint : undefined,
+      },
+      authenticatedClientId,
+      accessTokenResolver,
+      refreshTokenResolver,
+    });
+
+    return c.json(response);
+  } catch (error) {
+    if (error instanceof TokenError) {
+      const status = error.statusCode as 400 | 401;
+      if (error.wwwAuthenticate) c.header('WWW-Authenticate', error.wwwAuthenticate);
+      return c.json(
+        { error: error.error, error_description: error.errorDescription },
+        status,
+      );
+    }
+    if (error instanceof IntrospectionError) {
+      const status = error.statusCode as 400 | 401;
+      if (error.wwwAuthenticate) c.header('WWW-Authenticate', error.wwwAuthenticate);
+      return c.json(
+        { error: error.error, error_description: error.errorDescription },
+        status,
+      );
+    }
+    return c.json({ error: 'server_error' }, 500);
+  }
+});
+`;
+}
+
+export function revocationRouteTemplate(corePkg: string): string {
+  return `import { Hono } from 'hono';
+import {
+  authenticateClient,
+  handleRevocationRequest,
+  RevocationError,
+  TokenError,
+} from '${corePkg}';
+import {
+  tokenClientResolver as defaultTokenClientResolver,
+  revocationResolvers as defaultRevocationResolvers,
+} from '../resolvers.js';
+
+export const revocationApp = new Hono<{ Variables: Record<string, any> }>();
+
+function isFormUrlEncoded(contentType: string): boolean {
+  return contentType.toLowerCase().split(';')[0]?.trim() === 'application/x-www-form-urlencoded';
+}
+
+/**
+ * Token Revocation Endpoint
+ * RFC 7009 Section 2
+ *
+ * Confidential clients authenticate with their registered secret method. Public
+ * clients registered with token_endpoint_auth_method=none identify themselves
+ * with client_id only (RFC 7009 §2.1).
+ * Always returns 200 OK with no body for both "revoked" and "not found" cases
+ * to prevent client side-channels (RFC 7009 Section 2.2).
+ *
+ * Refresh token revocation also revokes sibling access tokens via grantId
+ * (RFC 7009 Section 2.1 SHOULD).
+ */
+revocationApp.post('/', async (c) => {
+  c.header('Cache-Control', 'no-store');
+  c.header('Pragma', 'no-cache');
+
+  if (!isFormUrlEncoded(c.req.header('Content-Type') ?? '')) {
+    return c.json(
+      {
+        error: 'invalid_request',
+        error_description: 'Content-Type must be application/x-www-form-urlencoded',
+      },
+      400,
+    );
+  }
+
+  const body = Object.fromEntries(new URLSearchParams(await c.req.text()));
+  const authorization = c.req.header('Authorization') ?? '';
+  const params = Object.fromEntries(
+    Object.entries(body).map(([k, v]) => [k, String(v)]),
+  );
+
+  try {
+    const tokenClientResolver = c.get('tokenClientResolver') ?? defaultTokenClientResolver;
+    const resolvers = c.get('revocationResolvers') ?? defaultRevocationResolvers;
+
+    const authenticatedClientId = await authenticateClient({
+      params,
+      authorizationHeader: authorization,
+      clientResolver: tokenClientResolver,
+    });
+
+    await handleRevocationRequest({
+      params: {
+        token: typeof params.token === 'string' ? params.token : undefined,
+        token_type_hint:
+          typeof params.token_type_hint === 'string' ? params.token_type_hint : undefined,
+      },
+      authenticatedClientId,
+      resolvers,
+    });
+
+    // RFC 7009 Section 2.2: empty body, 200 OK
+    return c.body(null, 200);
+  } catch (error) {
+    if (error instanceof TokenError) {
+      const status = error.statusCode as 400 | 401;
+      if (error.wwwAuthenticate) c.header('WWW-Authenticate', error.wwwAuthenticate);
+      return c.json(
+        { error: error.error, error_description: error.errorDescription },
+        status,
+      );
+    }
+    if (error instanceof RevocationError) {
+      const status = error.statusCode as 400 | 401;
+      if (error.wwwAuthenticate) c.header('WWW-Authenticate', error.wwwAuthenticate);
+      return c.json(
+        { error: error.error, error_description: error.errorDescription },
+        status,
+      );
+    }
+    return c.json({ error: 'server_error' }, 500);
+  }
+});
+`;
+}
+
+export function viewsTemplate(): string {
+  return `/**
+ * UI Views for OpenID Connect Provider.
+ *
+ * This file contains all user-facing HTML rendering.
+ * Customize these functions to match your application's design.
+ *
+ * Each function receives typed parameters and returns a ViewResult: either an
+ * HTML string (wrapped into a text/html Response by renderView) or a
+ * framework-native Response when you need full control over status / headers /
+ * body. You can replace the default HTML with any templating engine, JSX
+ * rendering, or UI framework of your choice.
+ */
+
+// ============================================================
+// View Parameter Types
+// ============================================================
+
+export interface LoginPageParams {
+  /** Transaction ID for the auth flow */
+  transactionId: string;
+  /** CSRF token (must be included as hidden form field) */
+  csrfToken: string;
+  /** Error message from a previous failed attempt */
+  error?: string;
+  /** Number of remaining login attempts */
+  remainingAttempts?: number;
+  /**
+   * OIDC Core 1.0 §3.1.2.1 login_hint: untrusted external value the OP MAY use to
+   * pre-fill the login form. Treated as a hint only (initial display); it MUST be
+   * HTML-attribute escaped before rendering since it is unauthenticated input.
+   */
+  loginHint?: string;
+}
+
+export interface ConsentPageParams {
+  /** Transaction ID for the auth flow */
+  transactionId: string;
+  /** CSRF token (must be included as hidden form field) */
+  csrfToken: string;
+  /** Scopes requested by the client */
+  scopes: string[];
+  /** Client ID requesting authorization */
+  clientId: string;
+}
+
+export interface ErrorPageParams {
+  /** Error message to display (OAuth error code for authorization errors) */
+  error: string;
+  /** Optional human-readable detail (OAuth error_description) */
+  errorDescription?: string;
+  /** HTTP status code */
+  statusCode: number;
+}
+
+// ============================================================
+// Views Interface
+// ============================================================
+
+/**
+ * A view may return a plain HTML string (the common case) or a fully formed
+ * Response when it needs to control the status code, headers, or stream a
+ * framework-native body. renderView() normalizes both into a Response.
+ */
+export type ViewResult = string | Response;
+
+export interface Views {
+  /** Render the login page (and login error page when error is set) */
+  loginPage(params: LoginPageParams): ViewResult;
+  /** Render the consent/authorization page */
+  consentPage(params: ConsentPageParams): ViewResult;
+  /** Render a generic error page */
+  errorPage(params: ErrorPageParams): ViewResult;
+}
+
+/** Options applied when renderView wraps an HTML string into a Response. */
+export interface RenderViewInit {
+  /** HTTP status code for the generated Response (defaults to 200). */
+  status?: number;
+}
+
+/**
+ * Normalize a ViewResult into a Response.
+ *
+ * - A Response is returned untouched, so a custom view keeps full control over
+ *   its status, headers, and body (e.g. returning a framework-rendered Response).
+ * - A string is wrapped into an HTML Response with the given status.
+ *
+ * Routes call renderView() instead of hard-coding string handling, so the Views
+ * return type can stay ViewResult and never silently collapse back to string.
+ */
+export function renderView(result: ViewResult, init?: RenderViewInit): Response {
+  if (typeof result === 'string') {
+    return new Response(result, {
+      status: init?.status ?? 200,
+      headers: { 'Content-Type': 'text/html; charset=UTF-8' },
+    });
+  }
+  if (result instanceof Response) {
+    return result;
+  }
+  return result;
+}
+
+// ============================================================
+// Default Views Implementation
+// Replace the functions below to customize the UI.
+// ============================================================
+
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/\"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function defaultLoginPage(params: LoginPageParams): string {
+  // Every string interpolated into HTML is escaped, including values that are
+  // server-generated by the default stores: users may replace stores/views.
+  const errorHtml = params.error
+    ? \`<p style="color: red;">\${escapeHtml(params.error)}\${
+        params.remainingAttempts !== undefined
+          ? \`. Attempts remaining: \${params.remainingAttempts}\`
+          : ''
+      }</p>\`
+    : '';
+
+  return \`<!DOCTYPE html>
+<html>
+<head><title>Login</title></head>
+<body>
+  <h1>Login</h1>
+  \${errorHtml}
+  <form method="POST" action="/login">
+    <input type="hidden" name="transaction_id" value="\${escapeHtml(params.transactionId)}" />
+    <input type="hidden" name="csrf_token" value="\${escapeHtml(params.csrfToken)}" />
+    <div>
+      <label for="username">Username:</label>
+      <input type="text" id="username" name="username" value="\${escapeHtml(params.loginHint ?? '')}" required />
+    </div>
+    <div>
+      <label for="password">Password:</label>
+      <input type="password" id="password" name="password" required />
+    </div>
+    <button type="submit">Login</button>
+  </form>
+</body>
+</html>\`;
+}
+
+function defaultConsentPage(params: ConsentPageParams): string {
+  // Every string interpolated into HTML is escaped, including values that are
+  // server-generated by the default stores: users may replace stores/views.
+  const scopeListHtml = params.scopes
+    .map((s) => \`    <li>\${escapeHtml(s)}</li>\`)
+    .join('\\n');
+
+  const escapedClientId = escapeHtml(params.clientId);
+
+  return \`<!DOCTYPE html>
+<html>
+<head><title>Consent</title></head>
+<body>
+  <h1>Authorize Application</h1>
+  <p>Client <strong>\${escapedClientId}</strong> is requesting access to the following scopes:</p>
+  <ul>
+\${scopeListHtml}
+  </ul>
+  <form method="POST" action="/consent">
+    <input type="hidden" name="transaction_id" value="\${escapeHtml(params.transactionId)}" />
+    <input type="hidden" name="csrf_token" value="\${escapeHtml(params.csrfToken)}" />
+    <button type="submit" name="action" value="approve">Approve</button>
+    <button type="submit" name="action" value="deny">Deny</button>
+  </form>
+</body>
+</html>\`;
+}
+
+function defaultErrorPage(params: ErrorPageParams): string {
+  // Escape error and error_description so a crafted error_description cannot
+  // inject markup into the browser error page (XSS).
+  const descriptionHtml = params.errorDescription
+    ? \`  <p>\${escapeHtml(params.errorDescription)}</p>\\n\`
+    : '';
+
+  return \`<!DOCTYPE html>
+<html>
+<head><title>Error</title></head>
+<body>
+  <h1>Error</h1>
+  <p>\${escapeHtml(params.error)}</p>
+\${descriptionHtml}</body>
+</html>\`;
+}
+
+/**
+ * Default Views used when no custom views are injected.
+ * These render minimal, unstyled HTML so the flow works out of the box.
+ */
+export const defaultViews: Views = {
+  loginPage: defaultLoginPage,
+  consentPage: defaultConsentPage,
+  errorPage: defaultErrorPage,
+};
+
+/**
+ * Build a Views instance, overriding any subset of the default views with your
+ * own implementation. Inject the result through the provider options instead of
+ * editing this file:
+ *
+ * @example
+ * // Provide your own login UI while keeping the default consent/error pages.
+ * createApp({
+ *   signingKeyProvider,
+ *   views: {
+ *     loginPage: (params) => myCustomLoginTemplate(params),
+ *   },
+ * });
+ */
+export function createViews(overrides?: Partial<Views>): Views {
+  if (!overrides) return defaultViews;
+  return { ...defaultViews, ...overrides };
+}
+`;
+}
+
+/**
+ * Shared, framework-neutral conformance test block that drives the FULL
+ * authorization-code / refresh-token flow over HTTP (app.request) and asserts the
+ * reuse-cascade contract:
+ *
+ *   OAuth 2.1 §4.1.2 / §4.3.1 (RFC 9700 §4.13/§4.14): reusing an authorization
+ *   code or a rotated-out refresh token MUST fail AND SHOULD revoke every token
+ *   previously issued under that grant. This only works because the generated
+ *   store marks codes / refresh tokens as used (consume) instead of deleting them,
+ *   so the reuse is detectable and the grantId is still known. If a user customizes
+ *   the generated store to physically delete (store.ts delete()) instead of
+ *   consume(), the cascade silently stops firing and these tests fail — surfacing
+ *   the broken contract (CLAUDE.md: conformance.test.ts is the generated OP's
+ *   behavior contract).
+ *
+ * Returned as a string interpolated into each framework's conformance template.
+ * Uses only string concatenation (no nested template literals) so it injects
+ * cleanly into the outer generated-file template literal.
+ */
+/**
+ * Module-level helpers (shared by the Hono and Web-standard conformance tests) for
+ * building a signed RS256 Request Object (OIDC Core 1.0 §6.1). Inserted after the
+ * testClients map; `signedRequestObject` is populated in beforeAll.
+ */
+export function requestObjectConformanceModuleSetup(
+  features: OidcFeatureConfig = DEFAULT_FEATURES,
+): string {
+  if (!features.requestObject) return '';
+  return `
+// OIDC Core 1.0 §6.1: a signed RS256 Request Object for the conformance flow,
+// built in beforeAll once the client signing key is generated.
+let signedRequestObject = '';
+
+function requestObjectB64Url(input: ArrayBuffer | Uint8Array): string {
+  const bytes = input instanceof Uint8Array ? input : new Uint8Array(input);
+  let binary = '';
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary).replace(/\\+/g, '-').replace(/\\//g, '_').replace(/=+$/, '');
+}
+
+function requestObjectB64UrlJson(value: unknown): string {
+  return requestObjectB64Url(new TextEncoder().encode(JSON.stringify(value)));
+}
+
+async function buildSignedRequestObject(
+  payload: Record<string, unknown>,
+  privateKey: CryptoKey,
+  kid: string,
+): Promise<string> {
+  const signingInput =
+    requestObjectB64UrlJson({ alg: 'RS256', kid, typ: 'oauth-authz-req+jwt' }) +
+    '.' +
+    requestObjectB64UrlJson(payload);
+  const signature = await crypto.subtle.sign(
+    { name: 'RSASSA-PKCS1-v1_5' },
+    privateKey,
+    new TextEncoder().encode(signingInput),
+  );
+  return signingInput + '.' + requestObjectB64Url(signature);
+}
+`;
+}
+
+/**
+ * beforeAll body fragment (shared) that generates a client signing key, registers
+ * its public JWK on the c-conf test client, and builds `signedRequestObject`.
+ */
+export function requestObjectConformanceBeforeAll(
+  features: OidcFeatureConfig = DEFAULT_FEATURES,
+): string {
+  if (!features.requestObject) return '';
+  return `
+  // OIDC Core 1.0 §6.1: register a client signing key and build a signed Request
+  // Object so the conformance flow can exercise request-object-by-value support.
+  const requestObjectKeyPair = await crypto.subtle.generateKey(
+    { name: 'RSASSA-PKCS1-v1_5', modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: 'SHA-256' },
+    true,
+    ['sign', 'verify'],
+  );
+  const requestObjectClient = testClients.get('c-conf');
+  if (requestObjectClient) {
+    requestObjectClient.jwks = {
+      keys: [await exportPublicJwk(requestObjectKeyPair.publicKey, 'c-conf-req-key')],
+    };
+  }
+  signedRequestObject = await buildSignedRequestObject(
+    {
+      response_type: 'code',
+      client_id: 'c-conf',
+      redirect_uri: REDIRECT_URI,
+      scope: 'openid',
+      state: 'req-obj',
+    },
+    requestObjectKeyPair.privateKey,
+    'c-conf-req-key',
+  );
+`;
+}
+
+export function reuseFlowConformanceTestBlock(
+  features: OidcFeatureConfig = DEFAULT_FEATURES,
+): string {
+  return (
+    reuseCascadeConformanceBlock(features) +
+    requestObjectValueConformanceBlock(features)
+  );
+}
+
+/**
+ * Reuse-cascade contract block. With refresh-token enabled it drives the full
+ * code/refresh flow; when disabled it pins the code-reuse cascade plus the
+ * unsupported_grant_type rejection for refresh_token requests.
+ */
+function reuseCascadeConformanceBlock(features: OidcFeatureConfig): string {
+  if (!features.refreshToken) {
+    return `
+  // OAuth 2.1 §4.1.2 / RFC 9700 §4.13: authorization code reuse must fail AND revoke
+  // the tokens issued from that grant. The refresh_token feature is disabled, so this
+  // block also pins that no refresh_token is issued and that the refresh_token grant
+  // itself is rejected with unsupported_grant_type (RFC 6749 §5.2).
+  describe('Authorization Code reuse (revoke-cascade contract)', () => {
+    // RFC 7636 Appendix B example PKCE pair (verifier -> its S256 challenge).
+    const PKCE_VERIFIER = 'dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk';
+    const PKCE_CHALLENGE_S256 = 'E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM';
+
+    // The login -> consent handoff is keyed by transaction_id (not a cookie), so the
+    // flow needs no cookie jar. These helpers only fetch and parse: they make no
+    // assertions and contain no branching, so every check stays in the it() blocks as
+    // an expect(). Test code carries no logic that could drift from the OP's behavior.
+    function relativeFrom(location: string | null): string {
+      const url = new URL(location ?? '', 'http://localhost');
+      return url.pathname + url.search;
+    }
+
+    function csrfFrom(html: string): string {
+      // Pure extraction: a missing token yields '' and the resulting non-302 login
+      // response is caught by an expect() in the it(), not by branching here.
+      return html.match(/name="csrf_token" value="([^"]+)"/)?.[1] ?? '';
+    }
+
+    function tokenRequest(fields: Record<string, string>): Promise<Response> {
+      return app.request('/token', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          client_id: 'c-conf',
+          client_secret: 's',
+          ...fields,
+        }).toString(),
+      });
+    }
+
+    function userinfoStatus(accessToken: string): Promise<number> {
+      return app
+        .request('/userinfo', { headers: { Authorization: 'Bearer ' + accessToken } })
+        .then((res) => res.status);
+    }
+
+    // Drive authorize -> login -> consent over HTTP and return every checkpoint as
+    // data. The it() blocks assert the redirect statuses / paths and read .code; this
+    // helper neither asserts nor branches, so the flow contract lives in the expect()s.
+    async function authorizeFlow(scope: string): Promise<{
+      authorizeStatus: number;
+      loginPath: string;
+      loginStatus: number;
+      consentPath: string;
+      consentStatus: number;
+      code: string;
+    }> {
+      // prompt=consent is required so OIDC Core 1.0 §11 grants offline_access (and
+      // thus a refresh token); without it the OP drops offline_access from the grant.
+      const authorizeUrl =
+        '/authorize?response_type=code&client_id=c-conf' +
+        '&redirect_uri=' + encodeURIComponent(REDIRECT_URI) +
+        '&scope=' + encodeURIComponent(scope) +
+        '&state=xyz&prompt=consent&acr_values=' + encodeURIComponent('urn:example:loa:2') +
+        '&code_challenge=' + PKCE_CHALLENGE_S256 + '&code_challenge_method=S256';
+
+      const authorizeRes = await app.request(authorizeUrl);
+      const loginPath = relativeFrom(authorizeRes.headers.get('Location'));
+      const transactionId =
+        new URL(loginPath, 'http://localhost').searchParams.get('transaction_id') ?? '';
+
+      const loginGet = await app.request(loginPath);
+      const loginRes = await app.request('/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          transaction_id: transactionId,
+          csrf_token: csrfFrom(await loginGet.text()),
+          username: 'testuser',
+          password: 'password',
+        }).toString(),
+      });
+      const consentPath = relativeFrom(loginRes.headers.get('Location'));
+
+      const consentGet = await app.request(consentPath);
+      const consentRes = await app.request('/consent', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          transaction_id: transactionId,
+          csrf_token: csrfFrom(await consentGet.text()),
+          action: 'approve',
+        }).toString(),
+      });
+      const callback = new URL(consentRes.headers.get('Location') ?? '', 'http://localhost');
+
+      return {
+        authorizeStatus: authorizeRes.status,
+        loginPath,
+        loginStatus: loginRes.status,
+        consentPath,
+        consentStatus: consentRes.status,
+        code: callback.searchParams.get('code') ?? '',
+      };
+    }
+
+    it('should reject authorization code reuse and revoke the access token from that grant', async () => {
+      // authorize -> login -> consent redirects through each OP step and hands back a code.
+      const flow = await authorizeFlow('openid');
+      expect(flow.authorizeStatus).toBe(302);
+      expect(flow.loginPath.startsWith('/login?')).toBe(true);
+      expect(flow.loginStatus).toBe(302);
+      expect(flow.consentPath.startsWith('/consent?')).toBe(true);
+      expect(flow.consentStatus).toBe(302);
+      const code = flow.code;
+
+      const first = await tokenRequest({
+        grant_type: 'authorization_code',
+        code,
+        redirect_uri: REDIRECT_URI,
+        code_verifier: PKCE_VERIFIER,
+      });
+      expect(first.status).toBe(200);
+      const firstBody = await first.json();
+      const accessToken = firstBody.access_token as string;
+
+      expect(idTokenPayload(firstBody.id_token as string).acr).toBe('urn:example:loa:2');
+      expect(idTokenPayload(firstBody.id_token as string).amr).toEqual(['pwd', 'otp']);
+
+      // The refresh_token feature is disabled: no refresh token is ever issued.
+      expect(firstBody.refresh_token).toBeUndefined();
+
+      // The freshly issued access token is accepted by UserInfo.
+      expect(await userinfoStatus(accessToken)).toBe(200);
+
+      // RFC 6749 §4.1.2: reusing the consumed code fails with invalid_grant.
+      const reuse = await tokenRequest({
+        grant_type: 'authorization_code',
+        code,
+        redirect_uri: REDIRECT_URI,
+        code_verifier: PKCE_VERIFIER,
+      });
+      expect(reuse.status).toBe(400);
+      expect((await reuse.json()).error).toBe('invalid_grant');
+
+      // Cascade: the access token issued from the reused code is now revoked.
+      expect(await userinfoStatus(accessToken)).toBe(401);
+    });
+
+    // The refresh_token grant is not offered (supportedGrantTypes), so the token
+    // endpoint rejects it with unsupported_grant_type before any grant processing.
+    it('should reject the refresh_token grant with unsupported_grant_type', async () => {
+      const res = await tokenRequest({
+        grant_type: 'refresh_token',
+        refresh_token: 'any-refresh-token',
+      });
+      expect(res.status).toBe(400);
+      expect(await res.json()).toEqual({
+        error: 'unsupported_grant_type',
+        error_description: 'Unsupported grant_type: refresh_token',
+      });
+    });
+  });
+`;
+  }
+  return `
+  // OAuth 2.1 §4.1.2 / §4.3.1, RFC 9700 §4.13/§4.14: authorization code reuse and
+  // rotated refresh-token reuse must fail AND revoke the tokens from that grant.
+  // Driven over real HTTP so a regression in the consume(used-mark) contract — e.g.
+  // a generated store switched to delete() — is caught as a failed cascade.
+  describe('Authorization Code & Refresh Token reuse (revoke-cascade contract)', () => {
+    // RFC 7636 Appendix B example PKCE pair (verifier -> its S256 challenge).
+    const PKCE_VERIFIER = 'dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk';
+    const PKCE_CHALLENGE_S256 = 'E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM';
+
+    // The login -> consent handoff is keyed by transaction_id (not a cookie), so the
+    // flow needs no cookie jar. These helpers only fetch and parse: they make no
+    // assertions and contain no branching, so every check stays in the it() blocks as
+    // an expect(). Test code carries no logic that could drift from the OP's behavior.
+    function relativeFrom(location: string | null): string {
+      const url = new URL(location ?? '', 'http://localhost');
+      return url.pathname + url.search;
+    }
+
+    function csrfFrom(html: string): string {
+      // Pure extraction: a missing token yields '' and the resulting non-302 login
+      // response is caught by an expect() in the it(), not by branching here.
+      return html.match(/name="csrf_token" value="([^"]+)"/)?.[1] ?? '';
+    }
+
+    function tokenRequest(fields: Record<string, string>): Promise<Response> {
+      return app.request('/token', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          client_id: 'c-conf',
+          client_secret: 's',
+          ...fields,
+        }).toString(),
+      });
+    }
+
+    function userinfoStatus(accessToken: string): Promise<number> {
+      return app
+        .request('/userinfo', { headers: { Authorization: 'Bearer ' + accessToken } })
+        .then((res) => res.status);
+    }
+
+    // Drive authorize -> login -> consent over HTTP and return every checkpoint as
+    // data. The it() blocks assert the redirect statuses / paths and read .code; this
+    // helper neither asserts nor branches, so the flow contract lives in the expect()s.
+    async function authorizeFlow(scope: string): Promise<{
+      authorizeStatus: number;
+      loginPath: string;
+      loginStatus: number;
+      consentPath: string;
+      consentStatus: number;
+      code: string;
+    }> {
+      // prompt=consent is required so OIDC Core 1.0 §11 grants offline_access (and
+      // thus a refresh token); without it the OP drops offline_access from the grant.
+      const authorizeUrl =
+        '/authorize?response_type=code&client_id=c-conf' +
+        '&redirect_uri=' + encodeURIComponent(REDIRECT_URI) +
+        '&scope=' + encodeURIComponent(scope) +
+        '&state=xyz&prompt=consent&acr_values=' + encodeURIComponent('urn:example:loa:2') +
+        '&code_challenge=' + PKCE_CHALLENGE_S256 + '&code_challenge_method=S256';
+
+      const authorizeRes = await app.request(authorizeUrl);
+      const loginPath = relativeFrom(authorizeRes.headers.get('Location'));
+      const transactionId =
+        new URL(loginPath, 'http://localhost').searchParams.get('transaction_id') ?? '';
+
+      const loginGet = await app.request(loginPath);
+      const loginRes = await app.request('/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          transaction_id: transactionId,
+          csrf_token: csrfFrom(await loginGet.text()),
+          username: 'testuser',
+          password: 'password',
+        }).toString(),
+      });
+      const consentPath = relativeFrom(loginRes.headers.get('Location'));
+
+      const consentGet = await app.request(consentPath);
+      const consentRes = await app.request('/consent', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          transaction_id: transactionId,
+          csrf_token: csrfFrom(await consentGet.text()),
+          action: 'approve',
+        }).toString(),
+      });
+      const callback = new URL(consentRes.headers.get('Location') ?? '', 'http://localhost');
+
+      return {
+        authorizeStatus: authorizeRes.status,
+        loginPath,
+        loginStatus: loginRes.status,
+        consentPath,
+        consentStatus: consentRes.status,
+        code: callback.searchParams.get('code') ?? '',
+      };
+    }
+
+    it('should reject authorization code reuse and revoke every token from that grant', async () => {
+      // authorize -> login -> consent redirects through each OP step and hands back a code.
+      const flow = await authorizeFlow('openid offline_access');
+      expect(flow.authorizeStatus).toBe(302);
+      expect(flow.loginPath.startsWith('/login?')).toBe(true);
+      expect(flow.loginStatus).toBe(302);
+      expect(flow.consentPath.startsWith('/consent?')).toBe(true);
+      expect(flow.consentStatus).toBe(302);
+      const code = flow.code;
+
+      const first = await tokenRequest({
+        grant_type: 'authorization_code',
+        code,
+        redirect_uri: REDIRECT_URI,
+        code_verifier: PKCE_VERIFIER,
+      });
+      expect(first.status).toBe(200);
+      const firstBody = await first.json();
+      const accessToken = firstBody.access_token as string;
+      const refreshToken = firstBody.refresh_token as string;
+
+      expect(idTokenPayload(firstBody.id_token as string).acr).toBe('urn:example:loa:2');
+      expect(idTokenPayload(firstBody.id_token as string).amr).toEqual(['pwd', 'otp']);
+
+      // The freshly issued access token is accepted by UserInfo.
+      expect(await userinfoStatus(accessToken)).toBe(200);
+
+      // RFC 6749 §4.1.2: reusing the consumed code fails with invalid_grant.
+      const reuse = await tokenRequest({
+        grant_type: 'authorization_code',
+        code,
+        redirect_uri: REDIRECT_URI,
+        code_verifier: PKCE_VERIFIER,
+      });
+      expect(reuse.status).toBe(400);
+      expect((await reuse.json()).error).toBe('invalid_grant');
+
+      // Cascade: the access token issued from the reused code is now revoked.
+      expect(await userinfoStatus(accessToken)).toBe(401);
+
+      // Cascade: the sibling refresh token from the same grant is revoked too.
+      const refreshAfter = await tokenRequest({
+        grant_type: 'refresh_token',
+        refresh_token: refreshToken,
+      });
+      expect(refreshAfter.status).toBe(400);
+      expect((await refreshAfter.json()).error).toBe('invalid_grant');
+    });
+
+    it('should reject rotated refresh token reuse and revoke every token from that grant', async () => {
+      // authorize -> login -> consent redirects through each OP step and hands back a code.
+      const flow = await authorizeFlow('openid offline_access');
+      expect(flow.authorizeStatus).toBe(302);
+      expect(flow.loginPath.startsWith('/login?')).toBe(true);
+      expect(flow.loginStatus).toBe(302);
+      expect(flow.consentPath.startsWith('/consent?')).toBe(true);
+      expect(flow.consentStatus).toBe(302);
+      const code = flow.code;
+
+      const first = await tokenRequest({
+        grant_type: 'authorization_code',
+        code,
+        redirect_uri: REDIRECT_URI,
+        code_verifier: PKCE_VERIFIER,
+      });
+      expect(first.status).toBe(200);
+      const firstRefresh = (await first.json()).refresh_token as string;
+
+      // OAuth 2.1 §4.3.1: rotation issues a new access + refresh token and marks the
+      // presented refresh token used.
+      const rotated = await tokenRequest({
+        grant_type: 'refresh_token',
+        refresh_token: firstRefresh,
+      });
+      expect(rotated.status).toBe(200);
+      const rotatedBody = await rotated.json();
+      const rotatedAccess = rotatedBody.access_token as string;
+      const rotatedRefresh = rotatedBody.refresh_token as string;
+      expect(await userinfoStatus(rotatedAccess)).toBe(200);
+
+      // Reusing the rotated-out refresh token is detected and fails.
+      const reuse = await tokenRequest({
+        grant_type: 'refresh_token',
+        refresh_token: firstRefresh,
+      });
+      expect(reuse.status).toBe(400);
+      expect((await reuse.json()).error).toBe('invalid_grant');
+
+      // Cascade: the rotated access + refresh token (same grant) are revoked.
+      expect(await userinfoStatus(rotatedAccess)).toBe(401);
+      const rotatedRefreshAfter = await tokenRequest({
+        grant_type: 'refresh_token',
+        refresh_token: rotatedRefresh,
+      });
+      expect(rotatedRefreshAfter.status).toBe(400);
+      expect((await rotatedRefreshAfter.json()).error).toBe('invalid_grant');
+    });
+  });
+`;
+}
+
+/**
+ * Request Object by value block. With request-object enabled it exercises the
+ * signed-RO flow; when disabled it pins the request_not_supported rejection and
+ * the discovery advertisement.
+ */
+function requestObjectValueConformanceBlock(features: OidcFeatureConfig): string {
+  if (!features.requestObject) {
+    return `
+  // OIDC Core 1.0 §6.3: the request parameter (Request Object by value) is disabled
+  // in this generated provider. Discovery advertises request_parameter_supported =
+  // false and the authorization endpoint rejects a request that uses the parameter
+  // with request_not_supported. request_uri (§6.2) remains rejected as well.
+  describe('Request Object disabled (OIDC Core 1.0 §6.3)', () => {
+    const PKCE_CHALLENGE_S256 = 'E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM';
+
+    it('should advertise request_parameter_supported as false', async () => {
+      const res = await app.request('/.well-known/openid-configuration');
+
+      expect(res.status).toBe(200);
+      const metadata = await res.json();
+      expect(metadata.request_parameter_supported).toBe(false);
+      expect(metadata.request_uri_parameter_supported).toBe(false);
+      expect(metadata.request_object_signing_alg_values_supported).toBeUndefined();
+    });
+
+    it('should reject the request parameter with a request_not_supported redirect', async () => {
+      const url =
+        '/authorize?response_type=code&client_id=c-conf' +
+        '&redirect_uri=' + encodeURIComponent(REDIRECT_URI) +
+        '&scope=openid&state=req-ns' +
+        '&request=' + encodeURIComponent('header.payload.signature') +
+        '&code_challenge=' + PKCE_CHALLENGE_S256 + '&code_challenge_method=S256';
+      const res = await app.request(url);
+
+      expect(res.status).toBe(302);
+      const location = new URL(res.headers.get('Location') ?? '', 'http://localhost');
+      expect(location.origin + location.pathname).toBe(REDIRECT_URI);
+      expect(location.searchParams.get('error')).toBe('request_not_supported');
+      expect(location.searchParams.get('state')).toBe('req-ns');
+    });
+
+    it('should reject the request_uri parameter with a request_uri_not_supported redirect', async () => {
+      const url =
+        '/authorize?response_type=code&client_id=c-conf' +
+        '&redirect_uri=' + encodeURIComponent(REDIRECT_URI) +
+        '&scope=openid&state=req-uri' +
+        '&request_uri=' + encodeURIComponent('https://client.example/req.jwt') +
+        '&code_challenge=' + PKCE_CHALLENGE_S256 + '&code_challenge_method=S256';
+      const res = await app.request(url);
+
+      expect(res.status).toBe(302);
+      const location = new URL(res.headers.get('Location') ?? '', 'http://localhost');
+      expect(location.origin + location.pathname).toBe(REDIRECT_URI);
+      expect(location.searchParams.get('error')).toBe('request_uri_not_supported');
+      expect(location.searchParams.get('state')).toBe('req-uri');
+    });
+  });
+`;
+  }
+  return `
+  // OIDC Core 1.0 §6.1 (Passing a Request Object by Value): the generated OP verifies
+  // a signed JWS Request Object against the client's registered JWKS and applies its
+  // claims (which supersede the OAuth query parameters). Discovery advertises
+  // request_parameter_supported = true and request_object_signing_alg_values_supported.
+  // request_uri (§6.2) remains unsupported and is rejected with
+  // request_uri_not_supported (§6.3). This is what the OIDF
+  // oidcc-ensure-request-object-with-redirect-uri /
+  // oidcc-unsigned-request-object-supported-correctly-or-rejected-as-unsupported
+  // modules exercise. If you change this behavior, update discovery metadata and this
+  // contract together.
+  describe('Request Object by value (OIDC Core 1.0 §6.1)', () => {
+    const PKCE_CHALLENGE_S256 = 'E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM';
+
+    it('should advertise request object support in discovery metadata', async () => {
+      const res = await app.request('/.well-known/openid-configuration');
+
+      expect(res.status).toBe(200);
+      const metadata = await res.json();
+      expect(metadata.request_parameter_supported).toBe(true);
+      expect(metadata.request_uri_parameter_supported).toBe(false);
+      expect(metadata.request_object_signing_alg_values_supported).toEqual(['RS256']);
+    });
+
+    it('should accept a signed RS256 request object and start the login flow', async () => {
+      const url =
+        '/authorize?response_type=code&client_id=c-conf' +
+        '&redirect_uri=' + encodeURIComponent(REDIRECT_URI) +
+        '&scope=openid' +
+        '&request=' + encodeURIComponent(signedRequestObject) +
+        '&code_challenge=' + PKCE_CHALLENGE_S256 + '&code_challenge_method=S256';
+      const res = await app.request(url);
+
+      // Accepted (not an error redirect): a transaction is created and the user is
+      // sent to the login page, carrying the request object's state via the txn.
+      expect(res.status).toBe(302);
+      const location = new URL(res.headers.get('Location') ?? '', 'http://localhost');
+      expect(location.pathname).toBe('/login');
+      expect(location.searchParams.get('error')).toBe(null);
+    });
+
+    it('should reject the request_uri parameter with a request_uri_not_supported redirect', async () => {
+      const url =
+        '/authorize?response_type=code&client_id=c-conf' +
+        '&redirect_uri=' + encodeURIComponent(REDIRECT_URI) +
+        '&scope=openid&state=req-uri' +
+        '&request_uri=' + encodeURIComponent('https://client.example/req.jwt') +
+        '&code_challenge=' + PKCE_CHALLENGE_S256 + '&code_challenge_method=S256';
+      const res = await app.request(url);
+
+      expect(res.status).toBe(302);
+      const location = new URL(res.headers.get('Location') ?? '', 'http://localhost');
+      expect(location.origin + location.pathname).toBe(REDIRECT_URI);
+      expect(location.searchParams.get('error')).toBe('request_uri_not_supported');
+      expect(location.searchParams.get('state')).toBe('req-uri');
+    });
+  });
+`;
+}
+
+/**
+ * Shared, framework-neutral conformance block proving the view layer honors the
+ * ViewResult / renderView contract: a view may return a plain HTML string
+ * (wrapped into a text/html Response) OR a framework-native Response that keeps
+ * full control of status / headers / body.
+ *
+ * renderView() is exercised directly (the generated views.ts export) so the
+ * string-wrapping and Response-pass-through behavior is pinned per framework. A
+ * final end-to-end check drives authorize -> /login over real HTTP to prove the
+ * login route actually delivers its view through renderView (not a string-only
+ * path) at runtime. If a future edit collapses Views back to a string-only
+ * contract, the Response pass-through assertion fails.
+ *
+ * The generated app's createApp() builds a single shared router instance, so the
+ * block reuses the module-level app instead of building a second one.
+ *
+ * Returned as a string interpolated into each framework's conformance template.
+ * Uses only string concatenation (no nested template literals) so it injects
+ * cleanly into the outer generated-file template literal.
+ */
+export function customViewConformanceTestBlock(): string {
+  return `
+  describe('custom view rendering (ViewResult / renderView)', () => {
+    // A view returning a plain HTML string is wrapped into a text/html Response.
+    it('should wrap a custom HTML string view into a text/html Response', async () => {
+      const res = renderView('<h1>custom-view-string</h1>');
+
+      expect(res.status).toBe(200);
+      expect(res.headers.get('Content-Type')).toBe('text/html; charset=UTF-8');
+      expect(await res.text()).toBe('<h1>custom-view-string</h1>');
+    });
+
+    // The caller-provided status is applied to a wrapped string view (e.g. the
+    // 429 rate-limit error page).
+    it('should apply the provided status when wrapping a string view', async () => {
+      const res = renderView('<h1>too many</h1>', { status: 429 });
+
+      expect(res.status).toBe(429);
+      expect(await res.text()).toBe('<h1>too many</h1>');
+    });
+
+    // A view returning a Response keeps full control of the HTTP response
+    // (status, headers, body) — proving Views is no longer string-fixed.
+    it('should pass a Response returned by a custom view through untouched', async () => {
+      const original = new Response('<h1>custom-view-response</h1>', {
+        status: 203,
+        headers: { 'Content-Type': 'text/html; charset=UTF-8', 'X-Custom-View': 'on' },
+      });
+      const res = renderView(original);
+
+      expect(res).toBe(original);
+      expect(res.status).toBe(203);
+      expect(res.headers.get('X-Custom-View')).toBe('on');
+      expect(await res.text()).toBe('<h1>custom-view-response</h1>');
+    });
+
+    // End-to-end: the login route returns its view via renderView, so the login
+    // page is delivered as a text/html Response through the framework at runtime.
+    it('should deliver the login page through renderView as a text/html Response', async () => {
+      // RFC 7636 Appendix B example challenge so authorize is accepted and mints a
+      // transaction (302 -> /login); the verifier is never needed here.
+      const PKCE_CHALLENGE_S256 = 'E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM';
+      const authorizeUrl =
+        '/authorize?response_type=code&client_id=c-conf' +
+        '&redirect_uri=' + encodeURIComponent(REDIRECT_URI) +
+        '&scope=' + encodeURIComponent('openid') +
+        '&state=view-xyz' +
+        '&code_challenge=' + PKCE_CHALLENGE_S256 + '&code_challenge_method=S256';
+      const authorizeRes = await app.request(authorizeUrl);
+      const loginUrl = new URL(authorizeRes.headers.get('Location') ?? '', 'http://localhost');
+
+      const res = await app.request(loginUrl.pathname + loginUrl.search);
+
+      // The login body carries a dynamic transaction_id / csrf_token, so the
+      // status + content type pin that renderView delivered a text/html Response
+      // at runtime; the exact-body wrapping is pinned by the renderView unit tests.
+      expect(res.status).toBe(200);
+      expect(res.headers.get('Content-Type')).toBe('text/html; charset=UTF-8');
+    });
+  });
+`;
+}
+
+/**
+ * Shared conformance-test fragments. Each fragment renders the enabled-feature
+ * text byte-identically to the historical output, and a disabled feature swaps
+ * in a block that pins the disabled behavior instead (404 / rejection / absent
+ * metadata), so a user who re-enables the code path is caught by the contract.
+ */
+export function conformanceTestClientsBlock(features: OidcFeatureConfig): string {
+  if (!features.refreshToken) {
+    return `const testClients = new Map<string, RegisteredClient>([
+  // The refresh_token grant is disabled in this generated provider, so the test
+  // client registers only authorization_code (RFC 7591 §2 default).
+  ['c-conf', {
+    clientId: 'c-conf',
+    clientSecret: 's',
+    redirectUris: [REDIRECT_URI],
+    clientType: 'confidential' as const,
+    responseTypes: ['code'],
+    grantTypes: ['authorization_code'],
+    tokenEndpointAuthMethod: 'client_secret_post',
+  }],
+  ['c-public', {
+    clientId: 'c-public',
+    redirectUris: [REDIRECT_URI],
+    clientType: 'public' as const,
+    responseTypes: ['code'],
+    grantTypes: ['authorization_code'],
+    tokenEndpointAuthMethod: 'none',
+  }],
+]);
+`;
+  }
+  return `const testClients = new Map<string, RegisteredClient>([
+  // offlineAccessAllowed + refresh_token grant so the reuse-cascade tests can drive
+  // the full code/refresh flow and observe revocation across the grant.
+  ['c-conf', {
+    clientId: 'c-conf',
+    clientSecret: 's',
+    redirectUris: [REDIRECT_URI],
+    clientType: 'confidential' as const,
+    responseTypes: ['code'],
+    grantTypes: ['authorization_code', 'refresh_token'],
+    tokenEndpointAuthMethod: 'client_secret_post',
+    offlineAccessAllowed: true,
+  }],
+  ['c-public', {
+    clientId: 'c-public',
+    redirectUris: [REDIRECT_URI],
+    clientType: 'public' as const,
+    responseTypes: ['code'],
+    grantTypes: ['authorization_code', 'refresh_token'],
+    tokenEndpointAuthMethod: 'none',
+    offlineAccessAllowed: true,
+  }],
+]);
+`;
+}
+
+export function scopesSupportedConformanceTest(features: OidcFeatureConfig): string {
+  if (!features.refreshToken) {
+    return `    // The refresh_token feature is disabled: offline_access must NOT be advertised
+    // (OIDC Core 1.0 §11 — it would never be granted). The full list is pinned so
+    // re-adding it (or dropping any scope) fails the contract.
+    it('should not advertise offline_access in scopes_supported', async () => {
+      const res = await app.request('/.well-known/openid-configuration');
+
+      expect(res.status).toBe(200);
+      const metadata = await res.json();
+      expect(metadata.scopes_supported).toEqual([
+        'openid',
+        'profile',
+        'email',
+        'address',
+        'phone',
+      ]);
+    });
+
+    // The token endpoint only offers authorization_code (supportedGrantTypes), and
+    // discovery must advertise exactly that.
+    it('should advertise only the authorization_code grant in grant_types_supported', async () => {
+      const res = await app.request('/.well-known/openid-configuration');
+
+      expect(res.status).toBe(200);
+      const metadata = await res.json();
+      expect(metadata.grant_types_supported).toEqual(['authorization_code']);
+    });
+`;
+  }
+  return `    // OIDC Core 1.0 §11: offline_access must be advertised so relying parties (and
+    // the OIDF Conformance Suite's oidcc-refresh-token module) request refresh
+    // tokens via 'scope=openid offline_access' with prompt=consent. The full list
+    // is pinned so dropping offline_access (or any scope) fails the contract.
+    it('should advertise offline_access in scopes_supported', async () => {
+      const res = await app.request('/.well-known/openid-configuration');
+
+      expect(res.status).toBe(200);
+      const metadata = await res.json();
+      expect(metadata.scopes_supported).toEqual([
+        'openid',
+        'profile',
+        'email',
+        'address',
+        'phone',
+        'offline_access',
+      ]);
+    });
+`;
+}
+
+export function featureDisabledDiscoveryConformanceTests(features: OidcFeatureConfig): string {
+  let tests = '';
+  if (!features.introspection) {
+    tests += `
+    // RFC 8414: the introspection endpoint is disabled, so its metadata must be absent.
+    it('should not advertise the disabled introspection endpoint', async () => {
+      const res = await app.request('/.well-known/openid-configuration');
+
+      expect(res.status).toBe(200);
+      const metadata = await res.json();
+      expect(metadata.introspection_endpoint).toBeUndefined();
+      expect(metadata.introspection_endpoint_auth_methods_supported).toBeUndefined();
+    });
+`;
+  }
+  if (!features.revocation) {
+    tests += `
+    // RFC 8414: the revocation endpoint is disabled, so its metadata must be absent.
+    it('should not advertise the disabled revocation endpoint', async () => {
+      const res = await app.request('/.well-known/openid-configuration');
+
+      expect(res.status).toBe(200);
+      const metadata = await res.json();
+      expect(metadata.revocation_endpoint).toBeUndefined();
+      expect(metadata.revocation_endpoint_auth_methods_supported).toBeUndefined();
+    });
+`;
+  }
+  return tests;
+}
+
+export function introspectionConformanceBlock(features: OidcFeatureConfig): string {
+  if (!features.introspection) {
+    return `  // RFC 7662 introspection is disabled in this generated provider: the route is not
+  // mounted, so requests to /introspect must fall through to the app's 404 handler.
+  describe('Introspection Endpoint disabled', () => {
+    it('should return 404 for the disabled introspection endpoint', async () => {
+      const res = await app.request('/introspect', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({ client_id: 'c-conf', client_secret: 's', token: 't' }).toString(),
+      });
+
+      expect(res.status).toBe(404);
+    });
+  });
+`;
+  }
+  return `  // RFC 7519 §4.1.5 / RFC 7662 §2.2: the token endpoint persists nbf (= iat) for both
+  // JWT and opaque access tokens, so introspection reports a not-yet-valid token inactive
+  // and echoes nbf for a valid one. Inject tokens with an explicit nbf to drive it.
+  describe('Token Introspection nbf validation (RFC 7662 §2.2)', () => {
+    function introspect(token: string): Promise<Response> {
+      return app.request('/introspect', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({ client_id: 'c-conf', client_secret: 's', token }).toString(),
+      });
+    }
+
+    it('should reject a non-form introspection request before parsing the body', async () => {
+      const res = await app.request('/introspect', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token: 'conf-nbf-ok' }),
+      });
+
+      expect(res.status).toBe(400);
+      expect(res.headers.get('Cache-Control')).toBe('no-store');
+      expect(res.headers.get('Pragma')).toBe('no-cache');
+      expect(await res.json()).toEqual({
+        error: 'invalid_request',
+        error_description: 'Content-Type must be application/x-www-form-urlencoded',
+      });
+    });
+
+    it('should accept a case-insensitive form media type with a charset', async () => {
+      const res = await app.request('/introspect', {
+        method: 'POST',
+        headers: { 'Content-Type': 'Application/X-WWW-Form-Urlencoded; charset=UTF-8' },
+        body: new URLSearchParams({ client_id: 'c-conf', client_secret: 's', token: 'missing' }).toString(),
+      });
+
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({ active: false });
+    });
+
+    it('should report active=true and echo nbf for a token with a valid (past) nbf', async () => {
+      const now = Math.floor(Date.now() / 1000);
+      accessTokenStore.set('conf-nbf-ok', {
+        sub: 'testuser',
+        clientId: 'c-conf',
+        scope: ['openid'],
+        expiresAt: now + 3600,
+        iat: now,
+        nbf: now,
+      });
+      const res = await introspect('conf-nbf-ok');
+      expect(res.status).toBe(200);
+      expect(await res.json()).toMatchObject({ active: true, nbf: now });
+    });
+
+    it('should report active=false for a token whose nbf is in the future', async () => {
+      const now = Math.floor(Date.now() / 1000);
+      accessTokenStore.set('conf-nbf-future', {
+        sub: 'testuser',
+        clientId: 'c-conf',
+        scope: ['openid'],
+        expiresAt: now + 3600,
+        iat: now,
+        nbf: now + 500,
+      });
+      const res = await introspect('conf-nbf-future');
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({ active: false });
+    });
+  });
+`;
+}
+
+export function revocationDisabledConformanceBlock(features: OidcFeatureConfig): string {
+  if (features.revocation) {
+    return `
+  describe('Token Revocation Endpoint (RFC 7009)', () => {
+    it('should reject a non-form revocation request before parsing the body', async () => {
+      const res = await app.request('/revoke', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token: 'public-token' }),
+      });
+
+      expect(res.status).toBe(400);
+      expect(res.headers.get('Cache-Control')).toBe('no-store');
+      expect(res.headers.get('Pragma')).toBe('no-cache');
+      expect(await res.json()).toEqual({
+        error: 'invalid_request',
+        error_description: 'Content-Type must be application/x-www-form-urlencoded',
+      });
+    });
+
+    it('should allow a public client to revoke its own token with client_id only', async () => {
+      const now = Math.floor(Date.now() / 1000);
+      accessTokenStore.set('public-token', {
+        sub: 'testuser',
+        clientId: 'c-public',
+        scope: ['openid'],
+        expiresAt: now + 3600,
+      });
+      const res = await app.request('/revoke', {
+        method: 'POST',
+        headers: { 'Content-Type': 'Application/X-WWW-Form-Urlencoded; charset=UTF-8' },
+        body: new URLSearchParams({ client_id: 'c-public', token: 'public-token' }).toString(),
+      });
+
+      expect(res.status).toBe(200);
+      expect(await res.text()).toBe('');
+      expect(accessTokenStore.get('public-token')).toBeUndefined();
+    });
+
+    it('should preserve a confidential client revocation', async () => {
+      const now = Math.floor(Date.now() / 1000);
+      accessTokenStore.set('confidential-own-token', {
+        sub: 'testuser',
+        clientId: 'c-conf',
+        scope: ['openid'],
+        expiresAt: now + 3600,
+      });
+      const res = await app.request('/revoke', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          client_id: 'c-conf',
+          client_secret: 's',
+          token: 'confidential-own-token',
+        }).toString(),
+      });
+
+      expect(res.status).toBe(200);
+      expect(await res.text()).toBe('');
+      expect(accessTokenStore.get('confidential-own-token')).toBeUndefined();
+    });
+
+    it('should let a public client revoke its refresh token and cascade the grant access tokens', async () => {
+      const now = Math.floor(Date.now() / 1000);
+      refreshTokenStore.set('public-refresh-token', {
+        subject: 'testuser',
+        clientId: 'c-public',
+        scope: ['openid', 'offline_access'],
+        expiresAt: now + 3600,
+        used: false,
+        grantId: 'public-refresh-grant',
+        originalIssuedAt: now,
+        authTime: now,
+      });
+      accessTokenStore.set('public-grant-access-token', {
+        sub: 'testuser',
+        clientId: 'c-public',
+        scope: ['openid'],
+        expiresAt: now + 3600,
+        grantId: 'public-refresh-grant',
+      });
+      const res = await app.request('/revoke', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          client_id: 'c-public',
+          token: 'public-refresh-token',
+          token_type_hint: 'refresh_token',
+        }).toString(),
+      });
+
+      expect(res.status).toBe(200);
+      expect(await res.text()).toBe('');
+      expect(refreshTokenStore.get('public-refresh-token')).toBeUndefined();
+      expect(accessTokenStore.get('public-grant-access-token')).toBeUndefined();
+    });
+
+    it('should reject a public revocation request without client_id', async () => {
+      const res = await app.request('/revoke', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({ token: 'public-token' }).toString(),
+      });
+
+      expect(res.status).toBe(401);
+      expect(await res.json()).toEqual({
+        error: 'invalid_client',
+        error_description: 'Client authentication required',
+      });
+    });
+
+    it('should reject a public client revoking another client token', async () => {
+      const now = Math.floor(Date.now() / 1000);
+      accessTokenStore.set('confidential-token', {
+        sub: 'testuser',
+        clientId: 'c-conf',
+        scope: ['openid'],
+        expiresAt: now + 3600,
+      });
+      const res = await app.request('/revoke', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({ client_id: 'c-public', token: 'confidential-token' }).toString(),
+      });
+
+      expect(res.status).toBe(400);
+      expect(await res.json()).toEqual({
+        error: 'invalid_grant',
+        error_description: 'Token was not issued to the requesting client',
+      });
+      expect(accessTokenStore.get('confidential-token')?.clientId).toBe('c-conf');
+    });
+  });
+`;
+  }
+  return `
+  // RFC 7009 revocation is disabled in this generated provider: the route is not
+  // mounted, so requests to /revoke must fall through to the app's 404 handler.
+  describe('Revocation Endpoint disabled', () => {
+    it('should return 404 for the disabled revocation endpoint', async () => {
+      const res = await app.request('/revoke', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({ client_id: 'c-conf', client_secret: 's', token: 't' }).toString(),
+      });
+
+      expect(res.status).toBe(404);
+    });
+  });
+`;
+}
+
+export function pkceDisabledConformanceBlock(features: OidcFeatureConfig): string {
+  if (features.pkce) return '';
+  return `
+  // PKCE is optional in this generated provider (allowNonPkceAuthorizationCodeFlow:
+  // true). OAuth 2.1 requires PKCE by default; this compatibility profile accepts a
+  // complete non-PKCE request from an explicit confidential client, while public
+  // clients and malformed PKCE values are still rejected by the core validator.
+  describe('Authorization Code Flow without PKCE (compatibility mode)', () => {
+    function relativePathFrom(location: string | null): string {
+      const url = new URL(location ?? '', 'http://localhost');
+      return url.pathname + url.search;
+    }
+
+    function csrfTokenFrom(html: string): string {
+      return html.match(/name="csrf_token" value="([^"]+)"/)?.[1] ?? '';
+    }
+
+    it('should complete the authorization code flow without PKCE for a confidential client', async () => {
+      const authorizeRes = await app.request(
+        '/authorize?response_type=code&client_id=c-conf' +
+        '&redirect_uri=' + encodeURIComponent(REDIRECT_URI) +
+        '&scope=openid&state=no-pkce',
+      );
+      expect(authorizeRes.status).toBe(302);
+      const loginPath = relativePathFrom(authorizeRes.headers.get('Location'));
+      expect(loginPath.startsWith('/login?')).toBe(true);
+      const transactionId =
+        new URL(loginPath, 'http://localhost').searchParams.get('transaction_id') ?? '';
+
+      const loginGet = await app.request(loginPath);
+      const loginRes = await app.request('/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          transaction_id: transactionId,
+          csrf_token: csrfTokenFrom(await loginGet.text()),
+          username: 'testuser',
+          password: 'password',
+        }).toString(),
+      });
+      expect(loginRes.status).toBe(302);
+      const consentPath = relativePathFrom(loginRes.headers.get('Location'));
+      expect(consentPath.startsWith('/consent?')).toBe(true);
+
+      const consentGet = await app.request(consentPath);
+      const consentRes = await app.request('/consent', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          transaction_id: transactionId,
+          csrf_token: csrfTokenFrom(await consentGet.text()),
+          action: 'approve',
+        }).toString(),
+      });
+      expect(consentRes.status).toBe(302);
+      const callback = new URL(consentRes.headers.get('Location') ?? '', 'http://localhost');
+      const code = callback.searchParams.get('code') ?? '';
+
+      const tokenRes = await app.request('/token', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          client_id: 'c-conf',
+          client_secret: 's',
+          grant_type: 'authorization_code',
+          code,
+          redirect_uri: REDIRECT_URI,
+        }).toString(),
+      });
+      expect(tokenRes.status).toBe(200);
+      const tokenBody = await tokenRes.json();
+      expect(tokenBody.token_type).toBe('Bearer');
+
+      const userinfoRes = await app.request('/userinfo', {
+        headers: { Authorization: 'Bearer ' + tokenBody.access_token },
+      });
+      expect(userinfoRes.status).toBe(200);
+    });
+  });
+`;
+}
+
+export function tokenEndpointAuthMethodsConformanceBlock(): string {
+  return `  describe('Token Endpoint client authentication methods', () => {
+    function relativeLocation(location: string | null): string {
+      const url = new URL(location ?? '', 'http://localhost');
+      return url.pathname + url.search;
+    }
+
+    function csrfTokenFrom(html: string): string {
+      return html.match(/name="csrf_token" value="([^"]+)"/)?.[1] ?? '';
+    }
+
+    it('should authenticate a public token request with client_id only', async () => {
+      const verifier = 'dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk';
+      const authorizeRes = await app.request(
+        '/authorize?response_type=code&client_id=c-public' +
+        '&redirect_uri=' + encodeURIComponent(REDIRECT_URI) +
+        '&scope=openid&state=public-auth' +
+        '&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&code_challenge_method=S256',
+      );
+      const loginPath = relativeLocation(authorizeRes.headers.get('Location'));
+      const transactionId =
+        new URL(loginPath, 'http://localhost').searchParams.get('transaction_id') ?? '';
+      const loginGet = await app.request(loginPath);
+      const loginRes = await app.request('/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          transaction_id: transactionId,
+          csrf_token: csrfTokenFrom(await loginGet.text()),
+          username: 'testuser',
+          password: 'password',
+        }).toString(),
+      });
+      const consentPath = relativeLocation(loginRes.headers.get('Location'));
+      const consentGet = await app.request(consentPath);
+      const consentRes = await app.request('/consent', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          transaction_id: transactionId,
+          csrf_token: csrfTokenFrom(await consentGet.text()),
+          action: 'approve',
+        }).toString(),
+      });
+      const callback = new URL(consentRes.headers.get('Location') ?? '', 'http://localhost');
+      const tokenRes = await app.request('/token', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          grant_type: 'authorization_code',
+          code: callback.searchParams.get('code') ?? '',
+          redirect_uri: REDIRECT_URI,
+          code_verifier: verifier,
+          client_id: 'c-public',
+        }).toString(),
+      });
+
+      expect(authorizeRes.status).toBe(302);
+      expect(new URL(loginPath, 'http://localhost').pathname).toBe('/login');
+      expect(loginRes.status).toBe(302);
+      expect(new URL(consentPath, 'http://localhost').pathname).toBe('/consent');
+      expect(consentRes.status).toBe(302);
+      expect(tokenRes.status).toBe(200);
+      const tokenBody = await tokenRes.json();
+      expect(tokenBody.token_type).toBe('Bearer');
+      expect(tokenBody.scope).toBe('openid');
+      expect((tokenBody.access_token as string).split('.')).toHaveLength(3);
+      expect((tokenBody.id_token as string).split('.')).toHaveLength(3);
+    });
+  });
+
+`;
+}
+
+export function endpointBehaviorConformanceBlock(
+  features: OidcFeatureConfig,
+  includeHonoApplyParity = false,
+): string {
+  const introspectionMethodTest = features.introspection
+    ? `
+      { path: '/introspect', method: 'GET', allow: 'POST' },`
+    : '';
+  const revocationMethodTest = features.revocation
+    ? `
+      { path: '/revoke', method: 'GET', allow: 'POST' },`
+    : '';
+  const corsPreflightTest = includeHonoApplyParity
+    ? `    it('should give createApp and applyOidc the same CORS preflight behavior', async () => {
+      const responses = await Promise.all(
+        [app, appliedApp].map(async (targetApp) => {
+          const res = await targetApp.request('/token', {
+            method: 'OPTIONS',
+            headers: {
+              Origin: 'https://client.example',
+              'Access-Control-Request-Method': 'POST',
+            },
+          });
+          return {
+            status: res.status,
+            origin: res.headers.get('Access-Control-Allow-Origin'),
+            methods: res.headers.get('Access-Control-Allow-Methods'),
+          };
+        }),
+      );
+
+      expect(responses).toEqual([
+        {
+          status: 204,
+          origin: 'https://client.example',
+          methods: 'POST,GET,OPTIONS',
+        },
+        {
+          status: 204,
+          origin: 'https://client.example',
+          methods: 'POST,GET,OPTIONS',
+        },
+      ]);
+    });`
+    : `    it('should let CORS middleware answer an OPTIONS preflight before the method guard', async () => {
+      const res = await app.request('/token', {
+        method: 'OPTIONS',
+        headers: {
+          Origin: 'https://client.example',
+          'Access-Control-Request-Method': 'POST',
+        },
+      });
+
+      expect(res.status).toBe(204);
+      expect(res.headers.get('Access-Control-Allow-Origin')).toBe('*');
+      expect(res.headers.get('Access-Control-Allow-Methods')).toBe('POST,GET,OPTIONS');
+    });`;
+  return `
+  describe('HTTP method enforcement (RFC 9110 §15.5.6)', () => {
+    it('should return 405 and an exact Allow header for unsupported endpoint methods', async () => {
+      const cases = [
+        { path: '/token', method: 'GET', allow: 'POST' },
+        { path: '/userinfo', method: 'PUT', allow: 'GET, POST' },${introspectionMethodTest}${revocationMethodTest}
+        { path: '/.well-known/openid-configuration', method: 'POST', allow: 'GET' },
+        { path: '/.well-known/jwks.json', method: 'POST', allow: 'GET' },
+      ];
+      const responses = await Promise.all(
+        cases.map(async (testCase) => {
+          const response = await app.request(testCase.path, { method: testCase.method });
+          return { status: response.status, allow: response.headers.get('Allow') };
+        }),
+      );
+
+      expect(responses).toEqual(cases.map((testCase) => ({ status: 405, allow: testCase.allow })));
+    });
+
+${corsPreflightTest}
+  });
+
+  describe('Consent denial (RFC 6749 §4.1.2.1)', () => {
+    function csrfTokenFrom(html: string): string {
+      return html.match(/name="csrf_token" value="([^"]+)"/)?.[1] ?? '';
+    }
+
+    it('should return access_denied and destroy the transaction and auth session', async () => {
+      const authorizeRes = await app.request(
+        '/authorize?response_type=code&client_id=c-conf' +
+        '&redirect_uri=' + encodeURIComponent(REDIRECT_URI) +
+        '&scope=openid&state=deny-state&prompt=consent' +
+        '&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM' +
+        '&code_challenge_method=S256',
+      );
+      expect(authorizeRes.status).toBe(302);
+      const loginUrl = new URL(authorizeRes.headers.get('Location') ?? '', 'http://localhost');
+      const transactionId = loginUrl.searchParams.get('transaction_id') ?? '';
+      const loginGet = await app.request(loginUrl.pathname + loginUrl.search);
+      const loginRes = await app.request('/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          transaction_id: transactionId,
+          csrf_token: csrfTokenFrom(await loginGet.text()),
+          username: 'testuser',
+          password: 'password',
+        }).toString(),
+      });
+      expect(loginRes.status).toBe(302);
+      const consentUrl = new URL(loginRes.headers.get('Location') ?? '', 'http://localhost');
+      const consentGet = await app.request(consentUrl.pathname + consentUrl.search);
+      const denyRes = await app.request('/consent', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          transaction_id: transactionId,
+          csrf_token: csrfTokenFrom(await consentGet.text()),
+          action: 'deny',
+        }).toString(),
+      });
+
+      expect(denyRes.status).toBe(302);
+      const callback = new URL(denyRes.headers.get('Location') ?? '', 'http://localhost');
+      expect(callback.origin + callback.pathname).toBe(REDIRECT_URI);
+      expect(callback.searchParams.get('error')).toBe('access_denied');
+      expect(callback.searchParams.get('state')).toBe('deny-state');
+      expect(callback.searchParams.get('iss')).toBe('http://localhost:3000');
+      expect(callback.searchParams.get('code')).toBe(null);
+      expect(callback.hash).toBe('');
+      expect(await transactionStore.get('auth_txn:' + transactionId)).toBe(null);
+      expect(await authSessionStore.get(transactionId)).toBeUndefined();
+    });
+  });
+`;
+}
+
+export function consentWithdrawalConformanceBlock(features: OidcFeatureConfig): string {
+  if (!features.refreshToken || !features.introspection) return '';
+  return `
+  describe('User-initiated consent withdrawal', () => {
+    const PKCE_VERIFIER = 'dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk';
+    const PKCE_CHALLENGE = 'E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM';
+
+    function csrfTokenFrom(html: string): string {
+      return html.match(/name="csrf_token" value="([^"]+)"/)?.[1] ?? '';
+    }
+
+    function relativeLocation(location: string | null): string {
+      const url = new URL(location ?? '', 'http://localhost');
+      return url.pathname + url.search;
+    }
+
+    function introspectActive(token: string): Promise<boolean> {
+      return app.request('/introspect', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          client_id: 'c-conf',
+          client_secret: 's',
+          token,
+        }).toString(),
+      }).then(async (response) => (await response.json()).active as boolean);
+    }
+
+    it('should revoke the withdrawn client grant while preserving another client grant', async () => {
+      const authorizeRes = await app.request(
+        '/authorize?response_type=code&client_id=c-conf' +
+        '&redirect_uri=' + encodeURIComponent(REDIRECT_URI) +
+        '&scope=' + encodeURIComponent('openid offline_access') +
+        '&state=withdraw&prompt=consent' +
+        '&code_challenge=' + PKCE_CHALLENGE + '&code_challenge_method=S256',
+      );
+      expect(authorizeRes.status).toBe(302);
+      const loginPath = relativeLocation(authorizeRes.headers.get('Location'));
+      const transactionId =
+        new URL(loginPath, 'http://localhost').searchParams.get('transaction_id') ?? '';
+
+      const loginGet = await app.request(loginPath);
+      const loginRes = await app.request('/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          transaction_id: transactionId,
+          csrf_token: csrfTokenFrom(await loginGet.text()),
+          username: 'testuser',
+          password: 'password',
+        }).toString(),
+      });
+      expect(loginRes.status).toBe(302);
+      const sessionCookie = loginRes.headers.get('Set-Cookie') ?? '';
+      const consentPath = relativeLocation(loginRes.headers.get('Location'));
+      const consentGet = await app.request(consentPath);
+      const consentRes = await app.request('/consent', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          transaction_id: transactionId,
+          csrf_token: csrfTokenFrom(await consentGet.text()),
+          action: 'approve',
+        }).toString(),
+      });
+      expect(consentRes.status).toBe(302);
+      const code = new URL(consentRes.headers.get('Location') ?? '', 'http://localhost')
+        .searchParams.get('code') ?? '';
+
+      const tokenRes = await app.request('/token', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          client_id: 'c-conf',
+          client_secret: 's',
+          grant_type: 'authorization_code',
+          code,
+          redirect_uri: REDIRECT_URI,
+          code_verifier: PKCE_VERIFIER,
+        }).toString(),
+      });
+      expect(tokenRes.status).toBe(200);
+      const tokenBody = await tokenRes.json();
+      const accessToken = tokenBody.access_token as string;
+      const refreshToken = tokenBody.refresh_token as string;
+
+      const now = Math.floor(Date.now() / 1000);
+      const otherAccessToken = 'other-client-access-token';
+      accessTokenStore.set(otherAccessToken, {
+        sub: 'testuser',
+        clientId: 'c-public',
+        scope: ['openid'],
+        expiresAt: now + 3600,
+        grantId: 'other-client-grant',
+      });
+      consentStore.grant('testuser', 'c-public', ['openid']);
+      consentStore.recordGrant('testuser', 'c-public', 'other-client-grant');
+
+      expect(await introspectActive(accessToken)).toBe(true);
+      expect(await introspectActive(otherAccessToken)).toBe(true);
+
+      await consentResolver.revokeConsent?.('testuser', 'c-conf');
+
+      const refreshAfter = await app.request('/token', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          client_id: 'c-conf',
+          client_secret: 's',
+          grant_type: 'refresh_token',
+          refresh_token: refreshToken,
+        }).toString(),
+      });
+      expect(refreshAfter.status).toBe(400);
+      expect((await refreshAfter.json()).error).toBe('invalid_grant');
+      expect(await introspectActive(accessToken)).toBe(false);
+      expect(await introspectActive(otherAccessToken)).toBe(true);
+      expect(consentStore.hasConsent('testuser', 'c-conf', ['openid'])).toBe(false);
+      expect(consentStore.hasConsent('testuser', 'c-public', ['openid'])).toBe(true);
+
+      const promptNoneRes = await app.request(
+        '/authorize?response_type=code&client_id=c-conf' +
+        '&redirect_uri=' + encodeURIComponent(REDIRECT_URI) +
+        '&scope=openid&state=withdraw-none&prompt=none' +
+        '&code_challenge=' + PKCE_CHALLENGE + '&code_challenge_method=S256',
+        { headers: { Cookie: sessionCookie } },
+      );
+      expect(promptNoneRes.status).toBe(302);
+      const promptNoneCallback = new URL(
+        promptNoneRes.headers.get('Location') ?? '',
+        'http://localhost',
+      );
+      expect(promptNoneCallback.searchParams.get('error')).toBe('consent_required');
+      expect(promptNoneCallback.searchParams.get('state')).toBe('withdraw-none');
+      expect(promptNoneCallback.searchParams.get('code')).toBe(null);
+    });
+  });
+`;
+}
+
+export function conformanceTestTemplate(
+  corePkg: string,
+  features: OidcFeatureConfig = DEFAULT_FEATURES,
+): string {
+  const exportPublicJwkImport = features.requestObject
+    ? `import { exportPublicJwk } from '${corePkg}';\n`
+    : '';
+  return `import { describe, it, expect, beforeAll } from 'vitest';
+import type { SigningKeyProvider, SigningKey } from '${corePkg}';
+import { Hono } from 'hono';
+${exportPublicJwkImport}import { createApp, validateSigningKeySet } from './app.js';
+import { applyOidc } from './apply.js';
+import { createInMemoryClientResolver, type RegisteredClient } from './config.js';
+import { accessTokenStore, authSessionStore, consentStore, refreshTokenStore, transactionStore } from './store.js';
+import { consentResolver } from './resolvers.js';
+import { defaultViews } from './views.js';
+import { renderView } from './views.js';
+
+/**
+ * HTTP conformance smoke tests for the generated OpenID Connect Provider.
+ *
+ * These drive the real Hono app through app.request() so a regression in the
+ * generated wiring (status / headers / JSON shape) is caught immediately —
+ * e.g. a template edit or a core API signature change that breaks the contract.
+ *
+ * Every assertion pins a single expected value to a concrete result so a
+ * regression cannot slip through a matcher that accepts a range of values.
+ *
+ * - Discovery exposes the mandatory provider metadata (OIDC Discovery 1.0 §3).
+ * - Token error responses are uncacheable OAuth error JSON (RFC 6749 §5.2).
+ * - UserInfo rejects invalid tokens with a Bearer challenge (RFC 6750 §3).
+ */
+
+const REDIRECT_URI = 'http://localhost:3000/callback';
+
+function idTokenPayload(idToken: string): Record<string, unknown> {
+  const payload = idToken.split('.')[1] ?? '';
+  return JSON.parse(new TextDecoder().decode(Uint8Array.from(atob(payload.replace(/-/g, '+').replace(/_/g, '/')), (char) => char.charCodeAt(0))));
+}
+
+${conformanceTestClientsBlock(features)}${requestObjectConformanceModuleSetup(features)}
+let app: ReturnType<typeof createApp>;
+let appliedApp: Hono;
+let signingKeyProvider: SigningKeyProvider;
+
+beforeAll(async () => {
+  // Ephemeral RS256 key so the createApp middleware can load a signing key.
+  const keyPair = await crypto.subtle.generateKey(
+    { name: 'RSASSA-PKCS1-v1_5', modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: 'SHA-256' },
+    true,
+    ['sign', 'verify'],
+  );
+  const publicJwk = await crypto.subtle.exportKey('jwk', keyPair.publicKey);
+  signingKeyProvider = {
+    async getSigningKey(): Promise<SigningKey> {
+      return { privateKey: keyPair.privateKey, publicJwk, keyId: 'test-key' };
+    },
+  };
+${requestObjectConformanceBeforeAll(features)}
+  app = createApp({
+    signingKeyProvider,
+    clientResolver: createInMemoryClientResolver(testClients),
+    acrResolver: async () => ({ acr: 'urn:example:loa:2', amr: ['pwd', 'otp'] }),
+    corsOrigins: 'https://client.example',
+  });
+  appliedApp = new Hono();
+  applyOidc(appliedApp, {
+    signingKeyProvider,
+    clientResolver: createInMemoryClientResolver(testClients),
+    acrResolver: async () => ({ acr: 'urn:example:loa:2', amr: ['pwd', 'otp'] }),
+    corsOrigins: 'https://client.example',
+  });
+});
+
+describe('generated provider HTTP conformance', () => {
+  describe('Generated view rendering', () => {
+    it('should HTML-escape every login and consent value', () => {
+      const hostile = '\"><script>alert(1)</script>';
+      const loginHtml = String(defaultViews.loginPage({
+        transactionId: hostile,
+        csrfToken: hostile,
+        error: '<img src=x onerror=alert(1)>',
+      }));
+      const consentHtml = String(defaultViews.consentPage({
+        transactionId: hostile,
+        csrfToken: hostile,
+        scopes: ['openid'],
+        clientId: 'client',
+      }));
+
+      expect(loginHtml.includes('<script>')).toBe(false);
+      expect(loginHtml.includes('<img src=x onerror=alert(1)>')).toBe(false);
+      expect(loginHtml.includes('&quot;&gt;&lt;script&gt;alert(1)&lt;/script&gt;')).toBe(true);
+      expect(loginHtml.includes('&lt;img src=x onerror=alert(1)&gt;')).toBe(true);
+      expect(consentHtml.includes('<script>')).toBe(false);
+      expect(consentHtml.includes('&quot;&gt;&lt;script&gt;alert(1)&lt;/script&gt;')).toBe(true);
+    });
+
+    it('should preserve a custom Response returned by a view', () => {
+      const customResponse = new Response('custom view', {
+        status: 202,
+        headers: { 'X-View-Renderer': 'custom' },
+      });
+      const rendered = renderView(customResponse, { status: 400 });
+
+      expect(rendered).toBe(customResponse);
+      expect(rendered.status).toBe(202);
+      expect(rendered.headers.get('X-View-Renderer')).toBe('custom');
+    });
+
+    it('should render a custom HTML string returned by the error view', async () => {
+      const customHtml = '<!DOCTYPE html><p>custom authorization error</p>';
+      const customApp = createApp({
+        signingKeyProvider,
+        clientResolver: createInMemoryClientResolver(testClients),
+        views: { errorPage: () => customHtml },
+      });
+      const res = await customApp.request(
+        '/authorize?response_type=code&client_id=c-conf' +
+        '&redirect_uri=' + encodeURIComponent('http://attacker.example/cb') +
+        '&scope=openid&state=custom-view' +
+        '&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&code_challenge_method=S256',
+      );
+
+      expect(res.status).toBe(400);
+      expect(res.headers.get('Content-Type')).toBe('text/html; charset=UTF-8');
+      expect(await res.text()).toBe(customHtml);
+    });
+  });
+
+  describe('Generated signing-key validation', () => {
+    it('should reject an RSA signing key below 2048 bits', () => {
+      const weakKey: SigningKey = {
+        privateKey: {} as CryptoKey,
+        publicJwk: { kty: 'RSA', n: '_'.repeat(170) + '8', e: 'AQAB' },
+        keyId: 'weak-key',
+      };
+
+      expect(() => validateSigningKeySet([weakKey])).toThrow(
+        'Signing key "weak-key" has a 1024-bit RSA modulus; minimum allowed is 2048 bits (NIST SP 800-131A Rev.2)',
+      );
+    });
+
+    it('should reject weak signing keys through createApp and applyOidc', async () => {
+      const weakKey: SigningKey = {
+        privateKey: {} as CryptoKey,
+        publicJwk: { kty: 'RSA', n: '_'.repeat(170) + '8', e: 'AQAB' },
+        keyId: 'weak-runtime-key',
+      };
+      const weakProvider: SigningKeyProvider = {
+        async getSigningKey(): Promise<SigningKey> {
+          return weakKey;
+        },
+        async getSigningKeys(): Promise<SigningKey[]> {
+          return [weakKey];
+        },
+      };
+      const createdApp = createApp({ signingKeyProvider: weakProvider });
+      const mountedApp = new Hono();
+      applyOidc(mountedApp, { signingKeyProvider: weakProvider });
+      const responses = await Promise.all(
+        [createdApp, mountedApp].map(async (targetApp) => {
+          const res = await targetApp.request('/.well-known/openid-configuration');
+          return { status: res.status, body: await res.json() };
+        }),
+      );
+
+      expect(responses).toEqual([
+        {
+          status: 503,
+          body: { error: 'server_error', error_description: 'Failed to load signing key' },
+        },
+        {
+          status: 503,
+          body: { error: 'server_error', error_description: 'Failed to load signing key' },
+        },
+      ]);
+    });
+
+    it('should reject an empty kid in a multiple-key set', () => {
+      const keyWithoutKid: SigningKey = {
+        privateKey: {} as CryptoKey,
+        publicJwk: { kty: 'EC', crv: 'P-256', x: 'x', y: 'y' },
+        keyId: '',
+      };
+      const keyWithKid: SigningKey = {
+        privateKey: {} as CryptoKey,
+        publicJwk: { kty: 'EC', crv: 'P-256', x: 'x', y: 'y' },
+        keyId: 'second-key',
+      };
+
+      expect(() => validateSigningKeySet([keyWithoutKid, keyWithKid])).toThrow(
+        'Multiple signing keys are published but a key has an empty kid (RFC 7517 §4.5)',
+      );
+    });
+
+    it('should reject duplicate kid values in a multiple-key set', () => {
+      const key: SigningKey = {
+        privateKey: {} as CryptoKey,
+        publicJwk: { kty: 'EC', crv: 'P-256', x: 'x', y: 'y' },
+        keyId: 'duplicate-key',
+      };
+
+      expect(() => validateSigningKeySet([key, key])).toThrow(
+        'Duplicate kid in signing key set: duplicate-key (RFC 7517 §4.5)',
+      );
+    });
+  });
+
+  describe('Discovery Endpoint', () => {
+    // OIDC Discovery 1.0 §3: these members MUST be advertised so relying parties
+    // can drive the Basic OP flow from metadata alone. The default issuer is
+    // http://localhost:3000 (config.ts), so every endpoint URL is fully pinned.
+    it('should return the required OIDC provider metadata fields', async () => {
+      const res = await app.request('/.well-known/openid-configuration');
+
+      expect(res.status).toBe(200);
+      const metadata = await res.json();
+      expect(metadata).toMatchObject({
+        issuer: 'http://localhost:3000',
+        authorization_endpoint: 'http://localhost:3000/authorize',
+        token_endpoint: 'http://localhost:3000/token',
+        jwks_uri: 'http://localhost:3000/.well-known/jwks.json',
+        userinfo_endpoint: 'http://localhost:3000/userinfo',
+        response_types_supported: ['code'],
+        // OAuth 2.0 Multiple Response Type Encoding Practices §2: the code flow
+        // returns the authorization response via query, so the OP advertises
+        // response_modes_supported as exactly ['query'].
+        response_modes_supported: ['query'],
+      });
+    });
+
+${scopesSupportedConformanceTest(features)}
+    // OIDC Core 1.0 §2 / §3.1.3.6 + Discovery 1.0 §3: claims_supported advertises
+    // the claims the OP can supply, including the ID Token protocol claims
+    // (auth_time/nonce/acr/amr/azp/at_hash). The full list is pinned so dropping
+    // any claim fails the contract. c_hash is excluded (Hybrid is not implemented).
+    it('should advertise the issuable claims in claims_supported', async () => {
+      const res = await app.request('/.well-known/openid-configuration');
+
+      expect(res.status).toBe(200);
+      const metadata = await res.json();
+      expect(metadata.claims_supported).toEqual([
+        'sub',
+        'iss',
+        'aud',
+        'exp',
+        'iat',
+        'auth_time',
+        'nonce',
+        'acr',
+        'amr',
+        'azp',
+        'at_hash',
+        'name',
+        'family_name',
+        'given_name',
+        'middle_name',
+        'nickname',
+        'preferred_username',
+        'profile',
+        'picture',
+        'website',
+        'gender',
+        'birthdate',
+        'zoneinfo',
+        'locale',
+        'updated_at',
+        'email',
+        'email_verified',
+        'address',
+        'phone_number',
+        'phone_number_verified',
+      ]);
+    });
+
+    // OIDC Discovery 1.0 §3 / Core 1.0 §5.5: claims_parameter_supported defaults
+    // to false when omitted, which makes spec-compliant RPs skip the (implemented)
+    // 'claims' request parameter. It is pinned to true so a regression is caught.
+    it('should advertise claims_parameter_supported as true', async () => {
+      const res = await app.request('/.well-known/openid-configuration');
+
+      expect(res.status).toBe(200);
+      const metadata = await res.json();
+      expect(metadata.claims_parameter_supported).toBe(true);
+    });
+
+    it('should advertise the exact supported token endpoint authentication methods', async () => {
+      const res = await app.request('/.well-known/openid-configuration');
+
+      expect(res.status).toBe(200);
+      const metadata = await res.json();
+      expect(metadata.token_endpoint_auth_methods_supported).toEqual([
+        'client_secret_basic',
+        'client_secret_post',
+        'none',
+      ]);
+    });
+
+    // RFC 8414 §3.2 / RFC 9111 §5.2: Discovery metadata is cacheable. The
+    // endpoint advertises a 3600s freshness lifetime so client libraries reuse
+    // the metadata deterministically, matching the JWKS endpoint (jwks.ts).
+    it('should return Cache-Control public, max-age=3600 on discovery response', async () => {
+      const res = await app.request('/.well-known/openid-configuration');
+
+      expect(res.status).toBe(200);
+      expect(res.headers.get('Cache-Control')).toBe('public, max-age=3600');
+    });
+${featureDisabledDiscoveryConformanceTests(features)}  });
+
+  describe('Token Endpoint error response', () => {
+    // RFC 6749 §5.2: token error responses carry a JSON body with an error
+    // member and MUST set Cache-Control: no-store so error JSON is never cached.
+    it('should return Cache-Control no-store and an OAuth error JSON', async () => {
+      const res = await app.request('/token', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        // Omit grant_type so the endpoint emits an invalid_request error response.
+        body: new URLSearchParams({ scope: 'openid' }).toString(),
+      });
+
+      expect(res.status).toBe(400);
+      expect(res.headers.get('Cache-Control')).toBe('no-store');
+      expect(await res.json()).toEqual({
+        error: 'invalid_request',
+        error_description: 'Missing required parameter: grant_type',
+      });
+    });
+  });
+
+  describe('UserInfo Endpoint', () => {
+    // RFC 6750 §3 / OIDC Core 1.0 §5.3.3: an invalid access token MUST be
+    // rejected with 401 and an exact WWW-Authenticate Bearer challenge.
+    it('should return 401 with a WWW-Authenticate Bearer challenge for an invalid token', async () => {
+      const res = await app.request('/userinfo', {
+        headers: { Authorization: 'Bearer this-token-does-not-exist' },
+      });
+
+      expect(res.status).toBe(401);
+      expect(res.headers.get('WWW-Authenticate')).toBe(
+        'Bearer realm="UserInfo", error="invalid_token", error_description="Access token is invalid"',
+      );
+    });
+
+    it('should return only the UserInfo realm when no access token is provided', async () => {
+      const res = await app.request('/userinfo');
+
+      expect(res.status).toBe(401);
+      expect(res.headers.get('WWW-Authenticate')).toBe('Bearer realm="UserInfo"');
+      expect(await res.json()).toEqual({
+        error: 'invalid_token',
+        error_description: 'Access token is required',
+      });
+    });
+
+    // RFC 9068 §4: the generated OP passes expectedAudience (its UserInfo endpoint URL) to
+    // handleUserInfoRequest, so aud validation is on by default for both JWT and opaque
+    // tokens. Flow-issued tokens always carry the UserInfo endpoint in aud, so these inject
+    // tokens with an explicit aud to exercise the accept/reject wiring end-to-end.
+    describe('Access Token Audience Validation (RFC 9068 §4)', () => {
+      const USERINFO_AUD = 'http://localhost:3000/userinfo';
+
+      it('should return 200 for a token whose aud includes the UserInfo endpoint', async () => {
+        const now = Math.floor(Date.now() / 1000);
+        accessTokenStore.set('conf-aud-ok', {
+          sub: 'testuser',
+          clientId: 'c-conf',
+          scope: ['openid'],
+          expiresAt: now + 3600,
+          audience: [USERINFO_AUD, 'https://api.example.com'],
+          issuer: 'http://localhost:3000',
+        });
+        const res = await app.request('/userinfo', {
+          headers: { Authorization: 'Bearer conf-aud-ok' },
+        });
+        expect(res.status).toBe(200);
+      });
+
+      it('should accept every supported UserInfo form media type spelling', async () => {
+        const now = Math.floor(Date.now() / 1000);
+        accessTokenStore.set('conf-post-ok', {
+          sub: 'testuser',
+          clientId: 'c-conf',
+          scope: ['openid'],
+          expiresAt: now + 3600,
+          audience: [USERINFO_AUD],
+          issuer: 'http://localhost:3000',
+        });
+        const contentTypes = [
+          'application/x-www-form-urlencoded',
+          'Application/X-WWW-Form-Urlencoded',
+          'application/x-www-form-urlencoded; charset=utf-8',
+        ];
+        const responses = await Promise.all(
+          contentTypes.map(async (contentType) => {
+            const res = await app.request('/userinfo', {
+              method: 'POST',
+              headers: { 'Content-Type': contentType },
+              body: new URLSearchParams({ access_token: 'conf-post-ok' }).toString(),
+            });
+            return { status: res.status, body: await res.json() };
+          }),
+        );
+
+        expect(responses).toEqual([
+          { status: 200, body: { sub: 'testuser' } },
+          { status: 200, body: { sub: 'testuser' } },
+          { status: 200, body: { sub: 'testuser' } },
+        ]);
+      });
+
+      it('should return 401 for a token whose aud excludes the UserInfo endpoint', async () => {
+        const now = Math.floor(Date.now() / 1000);
+        accessTokenStore.set('conf-aud-ng', {
+          sub: 'testuser',
+          clientId: 'c-conf',
+          scope: ['openid'],
+          expiresAt: now + 3600,
+          audience: ['https://api.example.com'],
+          issuer: 'http://localhost:3000',
+        });
+        const res = await app.request('/userinfo', {
+          headers: { Authorization: 'Bearer conf-aud-ng' },
+        });
+        expect(res.status).toBe(401);
+      });
+
+      it('should return 401 for a token with no stored aud (no opaque escape hatch)', async () => {
+        const now = Math.floor(Date.now() / 1000);
+        accessTokenStore.set('conf-aud-missing', {
+          sub: 'testuser',
+          clientId: 'c-conf',
+          scope: ['openid'],
+          expiresAt: now + 3600,
+          issuer: 'http://localhost:3000',
+        });
+        const res = await app.request('/userinfo', {
+          headers: { Authorization: 'Bearer conf-aud-missing' },
+        });
+        expect(res.status).toBe(401);
+      });
+    });
+  });
+
+${introspectionConformanceBlock(features)}
+  describe('Authorization Endpoint non-redirect errors', () => {
+    // A valid S256 challenge so the request is rejected solely on redirect_uri,
+    // not on a missing PKCE parameter.
+    const PKCE_CHALLENGE = 'E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM';
+    const unregisteredAuthorizeUrl =
+      '/authorize?response_type=code&client_id=c-conf' +
+      '&redirect_uri=' + encodeURIComponent('http://attacker.example/cb') +
+      '&scope=openid&state=abc' +
+      '&code_challenge=' + PKCE_CHALLENGE + '&code_challenge_method=S256';
+
+    // OIDC Core 1.0 §3.1.2.2: an unregistered redirect_uri MUST NOT be redirected
+    // to. Browser callers receive an HTML error page (HTTP 400) so the OIDF
+    // Conformance Suite (oidcc-ensure-registered-redirect-uri) can screenshot it.
+    it('should render an HTML error page (not redirect) for an unregistered redirect_uri', async () => {
+      const res = await app.request(unregisteredAuthorizeUrl);
+
+      expect(res.status).toBe(400);
+      expect(res.headers.get('Location')).toBe(null);
+      expect(res.headers.get('Content-Type')).toBe('text/html; charset=UTF-8');
+      const body = await res.text();
+      // Pinned to the default error page so a regression in the rendered markup
+      // (or a missing error_description) is caught exactly.
+      expect(body).toBe(
+        [
+          '<!DOCTYPE html>',
+          '<html>',
+          '<head><title>Error</title></head>',
+          '<body>',
+          '  <h1>Error</h1>',
+          '  <p>invalid_request</p>',
+          '  <p>redirect_uri not registered</p>',
+          '</body>',
+          '</html>',
+        ].join('\\n'),
+      );
+    });
+
+    // Programmatic callers that explicitly ask for JSON still receive the OAuth
+    // error JSON instead of the HTML page.
+    it('should return OAuth error JSON when the caller requests application/json', async () => {
+      const res = await app.request(unregisteredAuthorizeUrl, {
+        headers: { Accept: 'application/json' },
+      });
+
+      expect(res.status).toBe(400);
+      expect(res.headers.get('Location')).toBe(null);
+      expect(await res.json()).toEqual({
+        error: 'invalid_request',
+        error_description: 'redirect_uri not registered',
+      });
+    });
+  });
+${customViewConformanceTestBlock()}${endpointBehaviorConformanceBlock(features, true)}${consentWithdrawalConformanceBlock(features)}${reuseFlowConformanceTestBlock(features)}${revocationDisabledConformanceBlock(features)}${tokenEndpointAuthMethodsConformanceBlock()}${pkceDisabledConformanceBlock(features)}});
+`;
+}

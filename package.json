@@ -1,0 +1,48 @@
+{
+    "name": "maronn-oidc",
+    "version": "1.0.0",
+    "private": true,
+    "description": "Lightweight OpenID Connect / OAuth 2.1 provider library for rapidly verifying OAuth/OIDC specs in PoC — no Keycloak overhead, no IdaaS lock-in",
+    "scripts": {
+        "test": "echo \"Error: no test specified\" && exit 1",
+        "test:ci": "pnpm run test:supply-chain && pnpm --filter \"./packages/*\" test && pnpm run test:conformance",
+        "test:supply-chain": "node --test .github/scripts/*.test.mjs",
+        "test:e2e": "pnpm --filter @maronn-oidc/e2e test:e2e",
+        "test:conformance": "pnpm --filter @maronn-oidc/conformance test",
+        "conformance:basic-op": "pnpm --filter @maronn-oidc/conformance basic-op",
+        "typecheck": "pnpm --filter \"./packages/*\" typecheck && pnpm --filter \"./samples/*\" typecheck && pnpm --filter \"./tests/*\" typecheck",
+        "lint": "pnpm --filter \"./packages/*\" lint",
+        "build": "pnpm --filter @maronn-oidc/core --filter @maronn-oidc/cli run build",
+        "build:cli": "pnpm --filter @maronn-oidc/cli build && pnpm install",
+        "build:core": "pnpm --filter @maronn-oidc/core build && pnpm install",
+        "build:docs": "pnpm --filter @maronn-oidc/docs build:doc",
+        "changeset": "changeset",
+        "ci:version": "changeset version",
+        "ci:publish": "pnpm run build && changeset publish"
+    },
+    "keywords": [
+        "openid-connect",
+        "oauth2",
+        "oidc"
+    ],
+    "author": "maronnjapan",
+    "license": "MIT",
+    "packageManager": "pnpm@10.17.0",
+    "devDependencies": {
+        "@changesets/cli": "^2.31.1",
+        "@types/node": "^25.2.2"
+    },
+    "pnpm": {
+        "overrides": {
+            "vitest": "3.2.6",
+            "vite@>=6.0.0 <6.4.3": "6.4.3",
+            "rollup@>=4.0.0 <4.59.0": "4.59.0",
+            "picomatch@>=4.0.0 <4.0.4": "4.0.4",
+            "js-yaml@>=3.0.0 <4.0.0": "3.15.0",
+            "js-yaml@>=4.0.0 <5.0.0": "4.3.0",
+            "fast-uri@>=3.0.0 <3.1.4": "3.1.4",
+            "svgo@>=4.0.0 <4.0.2": "4.0.2",
+            "sharp@<0.35.0": "0.35.3"
+        }
+    }
+}

@@ -1,0 +1,10 @@
+packages:
+  - 'packages/*'
+  - 'samples/*'
+  - 'tests/*'
+  - 'docs/*'
+
+onlyBuiltDependencies:
+  - esbuild
+  - sharp
+  - workerd

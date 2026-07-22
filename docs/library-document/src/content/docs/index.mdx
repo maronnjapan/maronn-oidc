@@ -1,0 +1,35 @@
+---
+title: Maronn OIDC
+description: Lightweight OpenID Connect / OAuth 2.1 provider library for rapidly verifying specs in PoC.
+template: splash
+hero:
+  tagline: OAuth/OIDCの最新仕様を、どこでも、最速で検証するOSSライブラリ
+  actions:
+    - text: Get Started
+      link: ./introduction/
+      icon: right-arrow
+      variant: primary
+    - text: View on GitHub
+      link: https://github.com/maronnjapan/maronn-oidc
+      icon: external
+      variant: secondary
+---
+
+import { Card, CardGrid } from '@astrojs/starlight/components';
+
+## Features
+
+<CardGrid stagger>
+  <Card title="Speed" icon="rocket">
+    新しいOIDC/OAuth仕様が出たとき最速で実装・追随。Keycloakの構築コストなしですぐ試せる。
+  </Card>
+  <Card title="Fidelity" icon="approve-check-circle">
+    OpenID Connect Conformance準拠を信頼性のシグナルとして維持。仕様に忠実な実装。
+  </Card>
+  <Card title="Portability" icon="puzzle">
+    Web標準API（Fetch API / Web Crypto API）のみ使用。JavaScriptが動く環境ならどこでも動く。
+  </Card>
+  <Card title="No Dependencies" icon="seti:lock">
+    productionの依存関係に外部ライブラリを使用しない。軽量で監査しやすい。
+  </Card>
+</CardGrid>

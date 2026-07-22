@@ -1,0 +1,97 @@
+# Release ワークフロー
+#
+# Changesets で「Version Packages」PR を作り、その PR がマージされたら npm へ publish する。
+#
+# 【リリース運用フロー（重要）】
+#   このワークフローは「changeset を貯めて、出すときにまとめて公開する」二段階構成。
+#   changeset が 1 個でも即 publish されることはない。
+#
+#   1) 機能 PR で `pnpm changeset` を実行し `.changeset/*.md` を追加して main にマージする。
+#   2) main への push ごとに、未消化の changeset を 1 本の「Version Packages」PR に
+#      集約し続ける（version 段階）。この時点では publish しない。
+#      → changeset を複数貯めても、すべてこの 1 つの PR にまとまり CHANGELOG 案も集約される。
+#   3) 「そろそろリリースするか」となったら、その Version Packages PR をマージする。
+#      これで changeset が消化されてバージョン確定 → 次の push で publish が走る（publish 段階）。
+#
+#   つまりリリースのタイミングは「Version Packages PR をいつマージするか」で人間が制御する。
+#
+
+# publish は npm Trusted Publishing (OIDC) を利用する前提で構成している。
+#   - 長期トークン（NPM_TOKEN）は不要。OIDC で短命トークンを都度取得する。
+#   - provenance（来歴証明）は trusted publishing 利用時に自動付与される。
+#   - OIDC トークン取得には `permissions.id-token: write` が必須。
+#   - publish 実体は pnpm が担う。pnpm 10.17+ が OIDC trusted publishing に対応している
+#     （本リポジトリは packageManager で pnpm@10.17.0 を固定）。
+#
+# 【publish 前に npmjs.com 側で必要な設定】
+#   各パッケージ（@maronn-oidc/core, @maronn-oidc/cli）の
+#   npm ページ → Settings → Trusted Publisher で、以下を登録する:
+#     - Provider: GitHub Actions
+#     - Repository: maronnjapan/maronn-oidc
+#     - Workflow filename: release.yml
+#
+# 【初回 publish の注意（chicken-and-egg）】
+#   パッケージ単位の Trusted Publisher 設定は「パッケージが既に存在すること」が前提。
+#   そのため各パッケージの最初の 1 回だけは、ローカルから手動 publish するか、
+#   organization 単位の Trusted Publisher 設定を使う必要がある。
+#   2 回目以降は本ワークフローの OIDC publish だけで完結する。
+
+name: Release
+
+on:
+    push:
+        branches: [main]
+
+concurrency:
+    group: release-${{ github.workflow }}-${{ github.ref }}
+    cancel-in-progress: false
+
+# デフォルトを最小権限にし、必要な job だけ昇格する
+permissions: {}
+
+jobs:
+    release:
+        runs-on: ubuntu-latest
+        permissions:
+            contents: write # Version Packages PR の作成・タグ push に必要
+            pull-requests: write # Version Packages PR の作成に必要
+            id-token: write # npm Trusted Publishing (OIDC) のトークン取得に必須
+        steps:
+            - name: Checkout
+              uses: actions/checkout@v6
+
+            - name: Enable Corepack
+              run: corepack enable
+
+            - name: Setup Node.js
+              uses: actions/setup-node@v4
+              with:
+                  node-version: "22"
+                  cache: "pnpm"
+                  registry-url: "https://registry.npmjs.org"
+
+            - name: Update npm to a pinned stable version
+              run: npm install -g npm@11.17.0
+            - name: Install dependencies
+              run: pnpm install --frozen-lockfile
+
+            - name: Create Release PR or Publish to npm
+              id: changesets
+              uses: changesets/action@v1
+              with:
+                  # 未消化の changeset があれば Version Packages PR を作成/更新する。
+                  version: pnpm run ci:version
+                  # その PR がマージされ changeset が無くなった push で publish する。
+                  # ci:publish は build 後に `changeset publish`（実体は pnpm publish）を実行する。
+                  publish: pnpm run ci:publish
+              env:
+                  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+            # npm Trusted Publishing automatically creates provenance for public
+            # packages. Verify signatures, then require a verified SLSA provenance
+            # attestation for every exact name/version reported by Changesets.
+            - name: Verify published package provenance
+              if: steps.changesets.outputs.published == 'true'
+              env:
+                  PUBLISHED_PACKAGES: ${{ steps.changesets.outputs.publishedPackages }}
+              run: node .github/scripts/verify-npm-provenance.mjs
