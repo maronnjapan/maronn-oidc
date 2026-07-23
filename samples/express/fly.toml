@@ -1,0 +1,33 @@
+# Fly.io app configuration for verifying the node:sqlite storage backend
+# against a real deployment. `app` here is a placeholder — scripts/deploy-fly.sh
+# always overrides it with --app-name (Fly app names are globally unique).
+#
+# This pins the app to exactly one always-on machine (auto_stop_machines =
+# "off", min_machines_running = 1, max = 1). The signing key in this sample
+# is generated in memory at process startup (see src/app.ts); a second
+# concurrent machine would mint a different key under the same kid and break
+# token verification. Single-machine is a hard requirement, not a tuning
+# choice, until the sample loads a persisted signing key.
+app = "maronn-oidc-sample-express"
+primary_region = "nrt"
+
+[build]
+
+[env]
+  PORT = "3010"
+  OIDC_SQLITE_PATH = "/data/oidc.sqlite"
+
+[[mounts]]
+  source = "oidc_data"
+  destination = "/data"
+
+[http_service]
+  internal_port = 3010
+  force_https = true
+  auto_stop_machines = "off"
+  auto_start_machines = true
+  min_machines_running = 1
+  max_machines_running = 1
+
+[[vm]]
+  size = "shared-cpu-1x"

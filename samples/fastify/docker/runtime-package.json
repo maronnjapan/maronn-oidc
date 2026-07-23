@@ -1,0 +1,8 @@
+{
+  "name": "maronn-oidc-sample-fastify-runtime",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "fastify": "^5.6.2"
+  }
+}
