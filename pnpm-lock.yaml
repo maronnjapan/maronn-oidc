@@ -59,7 +59,7 @@ importers:
         specifier: 3.2.6
         version: 3.2.6(@edge-runtime/vm@5.0.0)(@types/debug@4.1.13)(@types/node@25.2.2)
 
-  samples/express:
+  samples/express-flyio:
     dependencies:
       '@maronn-oidc/core':
         specifier: workspace:*
@@ -84,7 +84,7 @@ importers:
         specifier: ^5.7.2
         version: 5.9.3
 
-  samples/fastify:
+  samples/fastify-flyio:
     dependencies:
       '@maronn-oidc/core':
         specifier: workspace:*
@@ -128,7 +128,7 @@ importers:
         specifier: ^4.113.0
         version: 4.113.0(@cloudflare/workers-types@5.20260723.1)(@types/node@25.2.2)
 
-  samples/nextjs:
+  samples/nextjs-vercel:
     dependencies:
       '@maronn-oidc/core':
         specifier: workspace:*
@@ -5338,7 +5338,7 @@ snapshots:
       process-warning: 5.0.0
       rfdc: 1.4.1
       secure-json-parse: 4.1.0
-      semver: 7.7.4
+      semver: 7.8.5
       toad-cache: 3.7.1
 
   fastq@1.20.1:
@@ -7199,7 +7199,7 @@ snapshots:
 
   vite@7.3.6(@types/node@25.2.2):
     dependencies:
-      esbuild: 0.27.7
+      esbuild: 0.28.1
       fdir: 6.5.0(picomatch@4.0.4)
       picomatch: 4.0.4
       postcss: 8.5.6

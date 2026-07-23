@@ -200,6 +200,9 @@ OpenID Connect機能については、packages/cliのコード生成する処理
 samples/*/src/oidc-providerについては、packages/cliによるコード生成されたものなので、この部分の修正が必要な場合は必ずpackages/cliを修正することで対応すること。
 クライアントやリソースサーバーはここに同居させず、E2E専用のものはtests/e2e配下に置くこと。
 
+ディレクトリ名は、どこへデプロイして検証する想定かが一目で分かるよう「フレームワーク-デプロイ想定環境」の形式で命名すること（例: `hono-cloudflare`, `express-flyio`, `fastify-flyio`, `nextjs-vercel`）。新しいサンプルを追加する場合もこの規則に従うこと。
+各サンプルは、リポジトリルートの `pnpm sample:<サンプル名>` で一発ローカル起動、`pnpm deploy:<サンプル名>` でガイド付き一発デプロイができる状態を維持すること。デプロイに人間の操作が必須な箇所（ログイン、外部サービスの資格情報など）は、デプロイスクリプト内のガイドで対話的に設定できるようにすること。
+
 ### tests/e2e
 PlaywrightによるE2Eテストを配置するディレクトリ。
 CLI生成された`samples/*`のOpenID Providerを実際に起動し、E2E専用のクライアントやリソースサーバーを`tests/e2e/apps`に分離して検証する。
