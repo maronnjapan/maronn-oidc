@@ -1,5 +1,5 @@
 {
-  "name": "maronn-oidc-sample-express-runtime",
+  "name": "maronn-oidc-sample-express-flyio-runtime",
   "private": true,
   "type": "module",
   "dependencies": {

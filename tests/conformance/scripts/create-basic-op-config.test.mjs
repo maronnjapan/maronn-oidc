@@ -208,7 +208,7 @@ describe('createBasicOpConformanceArtifacts', () => {
         alias: 'alias-with-trailing-slashes',
         opIssuer: 'https://op-tls:3443/',
         suiteBaseUrl: 'https://conformance-nginx:8443/',
-        sampleApp: 'express',
+        sampleApp: 'express-flyio',
       });
 
       assert.equal(artifacts.config.server.discoveryUrl, 'https://op-tls:3443/.well-known/openid-configuration');
@@ -242,11 +242,11 @@ describe('Basic OP PKCE compatibility mode', () => {
 describe('resolveSampleApp', () => {
   describe('sample app selection', () => {
     it('should resolve supported sample app metadata', () => {
-      assert.deepEqual(resolveSampleApp('fastify'), {
-        name: 'fastify',
+      assert.deepEqual(resolveSampleApp('fastify-flyio'), {
+        name: 'fastify-flyio',
         displayName: 'Fastify',
-        packageName: '@maronn-oidc/sample-fastify',
-        defaultStartCommand: 'node samples/fastify/dist/server.js',
+        packageName: '@maronn-oidc/sample-fastify-flyio',
+        defaultStartCommand: 'node samples/fastify-flyio/dist/server.js',
       });
     });
 
@@ -254,7 +254,7 @@ describe('resolveSampleApp', () => {
       assert.throws(
         () => resolveSampleApp('not-a-sample'),
         {
-          message: 'Unsupported CONFORMANCE_SAMPLE_APP "not-a-sample". Expected one of: hono-cloudflare, express, fastify, nextjs',
+          message: 'Unsupported CONFORMANCE_SAMPLE_APP "not-a-sample". Expected one of: hono-cloudflare, express-flyio, fastify-flyio, nextjs-vercel',
         },
       );
     });

@@ -65,30 +65,30 @@ const SAMPLE_APPS = new Map([
     },
   ],
   [
-    'express',
+    'express-flyio',
     {
-      name: 'express',
+      name: 'express-flyio',
       displayName: 'Express',
-      packageName: '@maronn-oidc/sample-express',
-      defaultStartCommand: 'node samples/express/dist/server.js',
+      packageName: '@maronn-oidc/sample-express-flyio',
+      defaultStartCommand: 'node samples/express-flyio/dist/server.js',
     },
   ],
   [
-    'fastify',
+    'fastify-flyio',
     {
-      name: 'fastify',
+      name: 'fastify-flyio',
       displayName: 'Fastify',
-      packageName: '@maronn-oidc/sample-fastify',
-      defaultStartCommand: 'node samples/fastify/dist/server.js',
+      packageName: '@maronn-oidc/sample-fastify-flyio',
+      defaultStartCommand: 'node samples/fastify-flyio/dist/server.js',
     },
   ],
   [
-    'nextjs',
+    'nextjs-vercel',
     {
-      name: 'nextjs',
+      name: 'nextjs-vercel',
       displayName: 'Next.js',
-      packageName: '@maronn-oidc/sample-nextjs',
-      defaultStartCommand: 'corepack enable && pnpm --dir samples/nextjs start',
+      packageName: '@maronn-oidc/sample-nextjs-vercel',
+      defaultStartCommand: 'corepack enable && pnpm --dir samples/nextjs-vercel start',
     },
   ],
 ]);

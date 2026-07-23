@@ -115,7 +115,7 @@ applyOidc(app, {
 });
 ```
 
-Honoではリクエストごとのバインディングを受け取るstorage factoryも指定できる。配線済みの実例は本リポジトリの `samples/hono-cloudflare` / `samples/express` / `samples/fastify` / `samples/nextjs` を参照。
+Honoではリクエストごとのバインディングを受け取るstorage factoryも指定できる。配線済みの実例は本リポジトリの `samples/hono-cloudflare` / `samples/express-flyio` / `samples/fastify-flyio` / `samples/nextjs-vercel` を参照。
 
 ## ライセンス
 

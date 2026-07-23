@@ -19,20 +19,20 @@ case "${SAMPLE_APP}" in
     SAMPLE_PACKAGE="@maronn-oidc/sample-hono-cloudflare"
     DEFAULT_START_COMMAND="corepack enable && pnpm --dir samples/hono-cloudflare start"
     ;;
-  express)
-    SAMPLE_PACKAGE="@maronn-oidc/sample-express"
-    DEFAULT_START_COMMAND="node samples/express/dist/server.js"
+  express-flyio)
+    SAMPLE_PACKAGE="@maronn-oidc/sample-express-flyio"
+    DEFAULT_START_COMMAND="node samples/express-flyio/dist/server.js"
     ;;
-  fastify)
-    SAMPLE_PACKAGE="@maronn-oidc/sample-fastify"
-    DEFAULT_START_COMMAND="node samples/fastify/dist/server.js"
+  fastify-flyio)
+    SAMPLE_PACKAGE="@maronn-oidc/sample-fastify-flyio"
+    DEFAULT_START_COMMAND="node samples/fastify-flyio/dist/server.js"
     ;;
-  nextjs)
-    SAMPLE_PACKAGE="@maronn-oidc/sample-nextjs"
-    DEFAULT_START_COMMAND="corepack enable && pnpm --dir samples/nextjs start"
+  nextjs-vercel)
+    SAMPLE_PACKAGE="@maronn-oidc/sample-nextjs-vercel"
+    DEFAULT_START_COMMAND="corepack enable && pnpm --dir samples/nextjs-vercel start"
     ;;
   *)
-    echo "Unsupported CONFORMANCE_SAMPLE_APP \"${SAMPLE_APP}\". Expected one of: hono-cloudflare, express, fastify, nextjs" >&2
+    echo "Unsupported CONFORMANCE_SAMPLE_APP \"${SAMPLE_APP}\". Expected one of: hono-cloudflare, express-flyio, fastify-flyio, nextjs-vercel" >&2
     exit 1
     ;;
 esac
