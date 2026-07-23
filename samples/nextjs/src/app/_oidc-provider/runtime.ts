@@ -6,6 +6,7 @@ import {
 } from '@maronn-oidc/core';
 import { createInMemoryClientResolver, type RegisteredClient } from './config';
 import { createOidcRouteHandlers } from './next';
+import { createNextJsProviderStores } from './storage-backend';
 import type { OidcProviderOptions } from './app';
 
 declare const process: { env: Record<string, string | undefined> } | undefined;
@@ -14,6 +15,7 @@ const signingKeyProvider = createCachedSigningKeyProvider(
   createEphemeralRs256KeyProvider(),
   60_000,
 );
+const providerStores = createNextJsProviderStores();
 
 // OIDC Core 1.0 §2 / §3.1.2.1: when a client requests an acr via `acr_values`
 // (or `claims.id_token.acr.values`), echo the most-preferred requested value back
@@ -60,6 +62,7 @@ export function createOidcProviderOptions(): OidcProviderOptions {
     signingKeyProvider,
     clientResolver,
     tokenClientResolver: clientResolver,
+    storage: providerStores,
     acrResolver: sampleAcrResolver,
     corsOrigins: readEnv('OIDC_CORS_ORIGINS') ?? issuer,
   };

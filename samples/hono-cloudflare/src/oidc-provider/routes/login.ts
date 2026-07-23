@@ -91,7 +91,7 @@ loginApp.post('/', async (c) => {
   if (loginPromptValues.includes('login') || loginPromptValues.includes('select_account')) {
     await authSessionStore.delete(transactionId);
     const existingSessionId = parseSessionId(c.req.header('Cookie') ?? null);
-    if (existingSessionId) browserSessionStore.delete(existingSessionId);
+    if (existingSessionId) await browserSessionStore.delete(existingSessionId);
   }
 
   const authTime = Math.floor(Date.now() / 1000);
@@ -106,7 +106,7 @@ loginApp.post('/', async (c) => {
   // SSO / prompt=none / max_age work on subsequent authorization requests
   // (OIDC Core 1.0 Section 3.1.2.3).
   const sessionId = await generateRandomString(32);
-  browserSessionStore.set(sessionId, { subject: user.sub, authTime });
+  await browserSessionStore.set(sessionId, { subject: user.sub, authTime });
   c.header('Set-Cookie', buildSessionCookie(sessionId));
 
   // Redirect to consent page

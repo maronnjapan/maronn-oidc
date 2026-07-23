@@ -8,6 +8,7 @@ import {
   extractAlgorithmParamsFromJwk,
 } from './crypto-utils';
 import type { JwkSet } from './jwks';
+import { isLoopbackHostname } from './loopback';
 
 /**
  * ID Tokenのペイロード
@@ -50,9 +51,9 @@ function validateIssuer(iss: string): void {
     throw new Error('Issuer must be a valid URL');
   }
 
-  // issuer must be https (except for localhost)
-  if (url.protocol !== 'https:' && url.hostname !== 'localhost' && url.hostname !== '127.0.0.1') {
-    throw new Error('Issuer must use https scheme (except for localhost)');
+  // issuer must be https (except for loopback hosts used during development)
+  if (url.protocol !== 'https:' && !isLoopbackHostname(url.hostname)) {
+    throw new Error('Issuer must use https scheme (except for loopback hosts)');
   }
 
   // issuer must not have query parameters

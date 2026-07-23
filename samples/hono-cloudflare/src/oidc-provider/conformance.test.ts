@@ -5,7 +5,7 @@ import { exportPublicJwk } from '@maronn-oidc/core';
 import { createApp, validateSigningKeySet } from './app.js';
 import { applyOidc } from './apply.js';
 import { createInMemoryClientResolver, type RegisteredClient } from './config.js';
-import { accessTokenStore, authSessionStore, consentStore, refreshTokenStore, transactionStore } from './store.js';
+import { accessTokenStore, authSessionStore, consentStore, createJsonProviderStores, refreshTokenStore, transactionStore, type JsonStoreBackend } from './store.js';
 import { consentResolver } from './resolvers.js';
 import { defaultViews } from './views.js';
 import { renderView } from './views.js';
@@ -147,6 +147,41 @@ beforeAll(async () => {
 });
 
 describe('generated provider HTTP conformance', () => {
+  describe('Persistent storage contract', () => {
+    it('should share state across provider store instances backed by the same backend', async () => {
+      const values = new Map<string, unknown>();
+      const backend: JsonStoreBackend = {
+        async get<T>(key: string): Promise<T | null> {
+          return (values.get(key) as T | undefined) ?? null;
+        },
+        async put<T>(key: string, value: T): Promise<void> {
+          values.set(key, value);
+        },
+        async delete(key: string): Promise<void> {
+          values.delete(key);
+        },
+        async list<T>(prefix: string): Promise<Array<{ key: string; value: T }>> {
+          return [...values.entries()]
+            .filter(([key]) => key.startsWith(prefix))
+            .map(([key, value]) => ({ key, value: value as T }));
+        },
+      };
+      const writerStores = createJsonProviderStores(backend);
+      await writerStores.authSessionStore.set('persistent-transaction', {
+        subject: 'testuser',
+        authTime: 1700000000,
+      });
+
+      const readerStores = createJsonProviderStores(backend);
+
+      expect(await readerStores.authSessionStore.get('persistent-transaction')).toEqual({
+        subject: 'testuser',
+        authTime: 1700000000,
+      });
+    });
+  });
+
+
   describe('Generated view rendering', () => {
     it('should HTML-escape every login and consent value', () => {
       const hostile = '"><script>alert(1)</script>';

@@ -98,21 +98,24 @@ Basic OP に必須の機能（authorize / token / userinfo / discovery / jwks / 
 ## 生成後のセットアップ
 
 1. ProviderConfig・署名鍵・クライアント resolver を環境変数 / DB / KV から供給する
-2. `config.ts` のデフォルト値はローカル検証専用として扱う
-3. 依存をインストールしてサーバーを起動する（例: `pnpm add hono @maronn-oidc/core`）
+2. 生成される `JsonStoreBackend` を実装し、`createJsonProviderStores()` の結果を `storage` に渡す
+3. `config.ts` と未指定時のインメモリストアはローカル検証・契約テスト専用として扱う
+4. 依存をインストールしてサーバーを起動する（例: `pnpm add hono @maronn-oidc/core`）
 
 署名鍵は `SigningKeyProvider` として注入する。`createCachedSigningKeyProvider()`（core 提供）でラップすると、TTL 付きキャッシュで鍵ローテーションに追随できる。
 
 ```typescript
 import { applyOidc } from './oidc-provider/apply.js';
+import { createJsonProviderStores } from './oidc-provider/store.js';
 
 applyOidc(app, {
   config: { issuer: 'http://localhost:3000' },
   signingKeyProvider: yourSigningKeyProvider,
+  storage: createJsonProviderStores(yourJsonStoreBackend),
 });
 ```
 
-配線済みの実例は本リポジトリの `samples/hono` / `samples/express` / `samples/fastify` / `samples/nextjs` を参照。
+Honoではリクエストごとのバインディングを受け取るstorage factoryも指定できる。配線済みの実例は本リポジトリの `samples/hono-cloudflare` / `samples/express` / `samples/fastify` / `samples/nextjs` を参照。
 
 ## ライセンス
 

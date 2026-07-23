@@ -202,6 +202,17 @@ describe('generateIdToken', () => {
         ).rejects.toThrow();
       });
 
+      it('should allow iss with any IPv4 loopback address for development', async () => {
+        const payload = createValidPayload({ iss: 'http://127.0.0.2:3000' });
+        const token = await generateIdToken({
+          payload,
+          privateKey: rsaKeyPair.privateKey,
+        });
+
+        const { payload: decodedPayload } = decodeJwt(token);
+        expect(decodedPayload.iss).toBe('http://127.0.0.2:3000');
+      });
+
       it('should throw when iss is missing', async () => {
         const payload = createValidPayload();
         delete (payload as Partial<IdTokenPayload>).iss;

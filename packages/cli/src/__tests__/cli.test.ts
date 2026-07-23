@@ -123,6 +123,18 @@ describe('CLI', () => {
       vi.restoreAllMocks();
     });
 
+    it('should instruct generated apps to inject persistent provider stores', () => {
+      const outputDir = join(testDir, 'persistent-output');
+      const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+
+      run(['generate', 'hono', '-o', outputDir]);
+
+      expect(consoleSpy).toHaveBeenCalledWith(
+        '  2. Inject persistent ProviderStores through the generated JsonStoreBackend contract',
+      );
+      vi.restoreAllMocks();
+    });
+
     it('should error for unknown framework', () => {
       const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
       run(['generate', 'unknown-framework']);

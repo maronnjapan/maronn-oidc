@@ -1,6 +1,10 @@
 import { getAuthTransaction } from '@maronn-oidc/core';
-import { transactionStore } from '../_oidc-provider/store';
+import { oidcProviderOptions } from '../_oidc-provider/runtime';
+import { defaultProviderStores } from '../_oidc-provider/store';
 import { loginAction } from './actions';
+
+const transactionStore =
+  (oidcProviderOptions.storage ?? defaultProviderStores).transactionStore;
 
 // Authorization redirects here with a per-request transaction_id, so the page
 // must always render dynamically (never statically cached).

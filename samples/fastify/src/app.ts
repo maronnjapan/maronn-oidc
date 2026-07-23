@@ -10,6 +10,7 @@ import {
   createInMemoryClientResolver,
   type RegisteredClient,
 } from './oidc-provider/config.js';
+import { providerStores } from './storage.js';
 
 const host = process.env.HOST ?? '127.0.0.1';
 const port = Number(process.env.PORT ?? '3010');
@@ -73,6 +74,7 @@ await applyOidc(app, {
   signingKeyProvider: createCachedSigningKeyProvider(createEphemeralRs256KeyProvider(), 60_000),
   clientResolver: createInMemoryClientResolver(clients),
   tokenClientResolver: createInMemoryClientResolver(clients),
+  storage: providerStores,
   acrResolver: sampleAcrResolver,
   corsOrigins: issuer,
 });

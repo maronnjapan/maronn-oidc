@@ -8,13 +8,15 @@ import {
   handleLoginFailure,
   generateRandomString,
 } from '@maronn-oidc/core';
-import {
+import { oidcProviderOptions } from '../_oidc-provider/runtime';
+import { defaultProviderStores, SESSION_COOKIE_NAME } from '../_oidc-provider/store';
+
+const {
   transactionStore,
   authSessionStore,
   browserSessionStore,
   userStore,
-  SESSION_COOKIE_NAME,
-} from '../_oidc-provider/store';
+} = oidcProviderOptions.storage ?? defaultProviderStores;
 
 /**
  * Login Server Action.
@@ -32,7 +34,7 @@ export async function loginAction(formData: FormData): Promise<void> {
   const transaction = await getAuthTransaction(transactionId, transactionStore);
   validateCsrfToken(transaction, csrfToken);
 
-  const user = userStore.authenticate(username, password);
+  const user = await userStore.authenticate(username, password);
   if (!user) {
     const failureResult = await handleLoginFailure(
       transactionId,
@@ -59,7 +61,7 @@ export async function loginAction(formData: FormData): Promise<void> {
   if (loginPromptValues.includes('login') || loginPromptValues.includes('select_account')) {
     await authSessionStore.delete(transactionId);
     const existingSessionId = cookieStore.get(SESSION_COOKIE_NAME)?.value;
-    if (existingSessionId) browserSessionStore.delete(existingSessionId);
+    if (existingSessionId) await browserSessionStore.delete(existingSessionId);
   }
 
   const authTime = Math.floor(Date.now() / 1000);
@@ -75,7 +77,7 @@ export async function loginAction(formData: FormData): Promise<void> {
   // Cookie attributes match buildSessionCookie() in store.ts so the
   // sessionResolver can read it back.
   const sessionId = await generateRandomString(32);
-  browserSessionStore.set(sessionId, { subject: user.sub, authTime });
+  await browserSessionStore.set(sessionId, { subject: user.sub, authTime });
   cookieStore.set(SESSION_COOKIE_NAME, sessionId, {
     httpOnly: true,
     secure: true,

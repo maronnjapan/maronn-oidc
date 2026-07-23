@@ -1,6 +1,10 @@
 import { getAuthTransaction } from '@maronn-oidc/core';
-import { transactionStore } from '../_oidc-provider/store';
+import { oidcProviderOptions } from '../_oidc-provider/runtime';
+import { defaultProviderStores } from '../_oidc-provider/store';
 import { consentAction } from './actions';
+
+const transactionStore =
+  (oidcProviderOptions.storage ?? defaultProviderStores).transactionStore;
 
 export const dynamic = 'force-dynamic';
 

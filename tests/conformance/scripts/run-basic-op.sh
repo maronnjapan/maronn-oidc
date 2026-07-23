@@ -8,16 +8,16 @@ GENERATED_DIR="${CONFORMANCE_DIR}/.generated"
 RESULTS_DIR="${CONFORMANCE_DIR}/results"
 COMPOSE_FILE="${CONFORMANCE_DIR}/docker-compose.yml"
 
-SAMPLE_APP="${CONFORMANCE_SAMPLE_APP:-hono}"
+SAMPLE_APP="${CONFORMANCE_SAMPLE_APP:-hono-cloudflare}"
 CONFORMANCE_OP_ISSUER="${CONFORMANCE_OP_ISSUER:-https://op-tls:3443}"
 CONFORMANCE_SUITE_BASE_URL="${CONFORMANCE_SUITE_BASE_URL:-https://conformance-nginx:8443}"
 CONFORMANCE_OP_ISSUER="${CONFORMANCE_OP_ISSUER%/}"
 CONFORMANCE_SUITE_BASE_URL="${CONFORMANCE_SUITE_BASE_URL%/}"
 
 case "${SAMPLE_APP}" in
-  hono)
-    SAMPLE_PACKAGE="@maronn-oidc/sample-hono"
-    DEFAULT_START_COMMAND="node samples/hono/dist/server.js"
+  hono-cloudflare)
+    SAMPLE_PACKAGE="@maronn-oidc/sample-hono-cloudflare"
+    DEFAULT_START_COMMAND="corepack enable && pnpm --dir samples/hono-cloudflare start"
     ;;
   express)
     SAMPLE_PACKAGE="@maronn-oidc/sample-express"
@@ -32,7 +32,7 @@ case "${SAMPLE_APP}" in
     DEFAULT_START_COMMAND="corepack enable && pnpm --dir samples/nextjs start"
     ;;
   *)
-    echo "Unsupported CONFORMANCE_SAMPLE_APP \"${SAMPLE_APP}\". Expected one of: hono, express, fastify, nextjs" >&2
+    echo "Unsupported CONFORMANCE_SAMPLE_APP \"${SAMPLE_APP}\". Expected one of: hono-cloudflare, express, fastify, nextjs" >&2
     exit 1
     ;;
 esac

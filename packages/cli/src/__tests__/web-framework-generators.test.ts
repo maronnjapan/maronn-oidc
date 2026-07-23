@@ -70,6 +70,19 @@ describe('ExpressGenerator', () => {
       expect(content).toContain('validateSigningKeySet');
     });
 
+    it('should inject persistent provider stores into every Web-standard request', () => {
+      const app = files.find((f) => f.path === 'app.ts');
+      const store = files.find((f) => f.path === 'store.ts');
+      const resolvers = files.find((f) => f.path === 'resolvers.ts');
+
+      expect(app?.content).toContain('storage?: ProviderStores;');
+      expect(app?.content).toContain('const stores = options.storage ?? defaultProviderStores;');
+      expect(app?.content).toContain("c.set('accessTokenStore', stores.accessTokenStore)");
+      expect(store?.content).toContain('export interface JsonStoreBackend');
+      expect(store?.content).toContain('export function createJsonProviderStores(');
+      expect(resolvers?.content).toContain('export function createStoreResolvers(');
+    });
+
     it('should generate a conformance test that drives the Web router directly', () => {
       const file = files.find((f) => f.path === 'conformance.test.ts');
       expect(file?.content).toContain("import { createApp, validateSigningKeySet } from './app.js'");
@@ -92,6 +105,16 @@ describe('ExpressGenerator', () => {
       );
       expect(file?.content).toContain(
         'should reject weak signing keys through the generated Web app',
+      );
+    });
+
+    it('should generate a conformance test for persistent storage injection', () => {
+      const file = files.find((f) => f.path === 'conformance.test.ts');
+
+      expect(file?.content).toContain("describe('Persistent storage contract'");
+      expect(file?.content).toContain('createJsonProviderStores');
+      expect(file?.content).toContain(
+        'should share state across provider store instances backed by the same backend',
       );
     });
 
@@ -276,6 +299,7 @@ describe('NextJsGenerator', () => {
         '_oidc-provider/routes/token.ts',
         '_oidc-provider/routes/userinfo.ts',
         '_oidc-provider/runtime.ts',
+        '_oidc-provider/storage-backend.ts',
         '_oidc-provider/store.ts',
         '_oidc-provider/views.ts',
         '_oidc-provider/web-router.ts',
@@ -339,8 +363,22 @@ export const OPTIONS = oidcHandlers.OPTIONS;
       expect(file?.content).toContain('createInMemoryClientResolver');
       expect(file?.content).toContain('OIDC_CLIENTS_JSON');
       expect(file?.content).toContain('OIDC_SIGNING_KEY_ID');
+      expect(file?.content).toContain('createNextJsProviderStores');
+      expect(file?.content).toContain('storage: providerStores');
       expect(file?.content).toContain('export const oidcProviderOptions = createOidcProviderOptions()');
       expect(file?.content).toContain('export const oidcHandlers = createOidcRouteHandlers(oidcProviderOptions)');
+    });
+
+    it('should generate Upstash Redis with a local SQLite fallback', () => {
+      const file = files.find((f) => f.path === '_oidc-provider/storage-backend.ts');
+      const content = file?.content ?? '';
+
+      expect(content).toContain("from 'node:sqlite'");
+      expect(content).toContain('class UpstashRedisJsonStoreBackend');
+      expect(content).toContain('UPSTASH_REDIS_REST_URL');
+      expect(content).toContain('UPSTASH_REDIS_REST_TOKEN');
+      expect(content).toContain("readEnv('VERCEL')");
+      expect(content).toContain("readEnv('OIDC_SQLITE_PATH') ?? '.data/oidc.sqlite'");
     });
 
     // OAuth 2.1 §4.1.2 / §4.3.1: Next.js also uses the Web-standard generated OP,

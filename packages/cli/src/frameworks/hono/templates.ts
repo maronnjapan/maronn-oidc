@@ -56,6 +56,16 @@ export function appTemplate(
   const revocationMount = features.revocation
     ? `  app.route('/revoke', revocationApp);\n`
     : '';
+  const refreshStorageContext = features.refreshToken
+    ? `    c.set('refreshTokenResolver', storeResolvers.refreshTokenResolver);\n`
+    : '';
+  const introspectionStorageContext = features.introspection
+    ? `    c.set('introspectionAccessTokenResolver', storeResolvers.introspectionAccessTokenResolver);
+    c.set('introspectionRefreshTokenResolver', storeResolvers.introspectionRefreshTokenResolver);\n`
+    : '';
+  const revocationStorageContext = features.revocation
+    ? `    c.set('revocationResolvers', storeResolvers.revocationResolvers);\n`
+    : '';
   const methodGuard = oidcMethodGuardTemplate(features);
   return `import { Hono } from 'hono';
 import { cors } from 'hono/cors';
@@ -72,9 +82,13 @@ import {
   type ProviderConfig,
 } from './config.js';
 import {
-  sessionResolver as defaultSessionResolver,
-  consentResolver as defaultConsentResolver,
+  createStoreResolvers,
 } from './resolvers.js';
+import {
+  defaultProviderStores,
+  type ProviderStores,
+  type ProviderStoresFactory,
+} from './store.js';
 import { createViews, type Views } from './views.js';
 import {
   assertHasRs256Key,
@@ -122,6 +136,8 @@ export interface CreateAppOptions {
    * Defaults to the in-memory consent store resolver in resolvers.ts.
    */
   consentResolver?: ConsentResolver;
+  /** Persistent stores, or a request-aware factory for bindings such as Cloudflare D1. */
+  storage?: ProviderStores | ProviderStoresFactory;
   acrResolver?: AcrResolver;
   /**
    * Custom UI for the login / consent / error pages.
@@ -204,6 +220,8 @@ ${introspectionCors}${revocationCors}  app.use('/.well-known/openid-configuratio
     const { privateKey, publicJwk, keyId } = signingKey;
     const clientResolver =
       options.clientResolver ?? createInMemoryClientResolver();
+    const stores = await resolveProviderStores(options.storage, c);
+    const storeResolvers = createStoreResolvers(stores);
 
     c.set('privateKey', privateKey);
     c.set('publicJwk', publicJwk);
@@ -220,10 +238,22 @@ ${introspectionCors}${revocationCors}  app.use('/.well-known/openid-configuratio
     c.set('config', createProviderConfig(options.config));
     c.set('clientResolver', clientResolver);
     c.set('tokenClientResolver', options.tokenClientResolver ?? clientResolver);
+    c.set('transactionStore', stores.transactionStore);
+    c.set('authCodeStore', stores.authCodeStore);
+    c.set('accessTokenStore', stores.accessTokenStore);
+    c.set('refreshTokenStore', stores.refreshTokenStore);
+    c.set('authSessionStore', stores.authSessionStore);
+    c.set('browserSessionStore', stores.browserSessionStore);
+    c.set('authenticateUser', (username: string, password: string) =>
+      stores.userStore.authenticate(username, password));
+    c.set('authCodeResolver', storeResolvers.authorizationCodeResolver);
+    c.set('accessTokenResolver', storeResolvers.accessTokenResolver);
+    c.set('userClaimsResolver', storeResolvers.userClaimsResolver);
+${refreshStorageContext}${introspectionStorageContext}${revocationStorageContext}
     // P1: default cookie-based session + consent resolvers so prompt=none /
     // max_age / SSO work out of the box (OIDC Core 1.0 Section 3.1.2.1 / 3.1.2.3).
-    c.set('sessionResolver', options.sessionResolver ?? defaultSessionResolver);
-    c.set('consentResolver', options.consentResolver ?? defaultConsentResolver);
+    c.set('sessionResolver', options.sessionResolver ?? storeResolvers.sessionResolver);
+    c.set('consentResolver', options.consentResolver ?? storeResolvers.consentResolver);
     if (options.acrResolver) {
       c.set('acrResolver', options.acrResolver);
     }
@@ -246,6 +276,14 @@ ${introspectionMount}${revocationMount}  app.route('/.well-known/jwks.json', jwk
   app.route('/consent', consentApp);
 
   return app;
+}
+
+async function resolveProviderStores(
+  storage: CreateAppOptions['storage'],
+  context: any,
+): Promise<ProviderStores> {
+  if (!storage) return defaultProviderStores;
+  return typeof storage === 'function' ? storage(context) : storage;
 }
 `;
 }
@@ -827,6 +865,399 @@ export class UserStore {
   }
 }
 
+export type Awaitable<T> = T | Promise<T>;
+
+export interface JsonStoreEntry<T> {
+  key: string;
+  value: T;
+}
+
+/**
+ * Minimal JSON key/value contract used by generated persistent stores.
+ * Implement it with D1, SQLite, Redis, KV, or another deployment-native store.
+ * list() must return only live entries whose keys start with prefix.
+ */
+export interface JsonStoreBackend {
+  get<T>(key: string): Promise<T | null>;
+  put<T>(key: string, value: T, ttlSeconds?: number): Promise<void>;
+  delete(key: string): Promise<void>;
+  list<T>(prefix: string): Promise<Array<JsonStoreEntry<T>>>;
+}
+
+export interface AuthorizationCodeStorage {
+  set(code: string, info: AuthorizationCodeInfo): Awaitable<void>;
+  get(code: string): Awaitable<AuthorizationCodeInfo | undefined>;
+  consume(code: string): Awaitable<void>;
+  delete(code: string): Awaitable<void>;
+}
+
+export interface AccessTokenStorage {
+  set(token: string, info: AccessTokenInfo): Awaitable<void>;
+  get(token: string): Awaitable<AccessTokenInfo | undefined>;
+  delete(token: string): Awaitable<void>;
+  revokeByGrantId(grantId: string): Awaitable<void>;
+  revoke(token: string): Awaitable<void>;
+}
+
+export interface RefreshTokenStorage {
+  set(token: string, info: RefreshTokenInfo): Awaitable<void>;
+  get(token: string): Awaitable<RefreshTokenInfo | undefined>;
+  consume(token: string): Awaitable<void>;
+  delete(token: string): Awaitable<void>;
+  revokeByGrantId(grantId: string): Awaitable<void>;
+  revoke(token: string): Awaitable<void>;
+}
+
+export interface AuthSessionStorage {
+  set(transactionId: string, info: AuthSessionInfo): Awaitable<void>;
+  get(transactionId: string): Awaitable<AuthSessionInfo | undefined>;
+  delete(transactionId: string): Awaitable<void>;
+}
+
+export interface BrowserSessionStorage {
+  set(sessionId: string, info: BrowserSessionInfo): Awaitable<void>;
+  get(sessionId: string): Awaitable<BrowserSessionInfo | undefined>;
+  delete(sessionId: string): Awaitable<void>;
+}
+
+export interface ConsentStorage {
+  grant(subject: string, clientId: string, scopes: string[]): Awaitable<void>;
+  hasConsent(subject: string, clientId: string, scopes: string[]): Awaitable<boolean>;
+  recordGrant(subject: string, clientId: string, grantId: string): Awaitable<void>;
+  revoke(subject: string, clientId: string): Awaitable<string[]>;
+}
+
+export interface UserStorage {
+  authenticate(
+    username: string,
+    password: string,
+  ): Awaitable<(UserClaims & { password: string }) | undefined>;
+  getClaims(sub: string): Awaitable<UserClaims | undefined>;
+}
+
+export interface ProviderStores {
+  transactionStore: AuthTransactionStore;
+  authCodeStore: AuthorizationCodeStorage;
+  accessTokenStore: AccessTokenStorage;
+  refreshTokenStore: RefreshTokenStorage;
+  authSessionStore: AuthSessionStorage;
+  browserSessionStore: BrowserSessionStorage;
+  consentStore: ConsentStorage;
+  userStore: UserStorage;
+}
+
+export type ProviderStoresFactory = (
+  context: any,
+) => Awaitable<ProviderStores>;
+
+const TRANSACTION_PREFIX = 'transaction:';
+const AUTHORIZATION_CODE_PREFIX = 'authorization-code:';
+const ACCESS_TOKEN_PREFIX = 'access-token:';
+const REFRESH_TOKEN_PREFIX = 'refresh-token:';
+const AUTH_SESSION_PREFIX = 'auth-session:';
+const BROWSER_SESSION_PREFIX = 'browser-session:';
+const CONSENT_PREFIX = 'consent:';
+const USER_PREFIX = 'user:';
+
+class JsonTransactionStore implements AuthTransactionStore {
+  constructor(private readonly backend: JsonStoreBackend) {}
+
+  async get(key: string): Promise<AuthTransaction | null> {
+    return this.backend.get<AuthTransaction>(TRANSACTION_PREFIX + key);
+  }
+
+  async put(key: string, value: AuthTransaction, ttlSeconds: number): Promise<void> {
+    await this.backend.put(TRANSACTION_PREFIX + key, value, ttlSeconds);
+  }
+
+  async delete(key: string): Promise<void> {
+    await this.backend.delete(TRANSACTION_PREFIX + key);
+  }
+}
+
+class JsonAuthorizationCodeStore implements AuthorizationCodeStorage {
+  constructor(private readonly backend: JsonStoreBackend) {}
+
+  async set(code: string, info: AuthorizationCodeInfo): Promise<void> {
+    await this.backend.put(
+      AUTHORIZATION_CODE_PREFIX + code,
+      info,
+      ttlUntil(info.expiresAt),
+    );
+  }
+
+  async get(code: string): Promise<AuthorizationCodeInfo | undefined> {
+    const entry = await this.backend.get<AuthorizationCodeInfo>(AUTHORIZATION_CODE_PREFIX + code);
+    if (!entry) return undefined;
+    if (entry.expiresAt <= epochSeconds()) {
+      await this.delete(code);
+      return undefined;
+    }
+    return entry;
+  }
+
+  async consume(code: string): Promise<void> {
+    const entry = await this.get(code);
+    if (!entry) return;
+    await this.set(code, { ...entry, used: true });
+  }
+
+  async delete(code: string): Promise<void> {
+    await this.backend.delete(AUTHORIZATION_CODE_PREFIX + code);
+  }
+}
+
+class JsonAccessTokenStore implements AccessTokenStorage {
+  constructor(private readonly backend: JsonStoreBackend) {}
+
+  async set(token: string, info: AccessTokenInfo): Promise<void> {
+    await this.backend.put(ACCESS_TOKEN_PREFIX + token, info, ttlUntil(info.expiresAt));
+  }
+
+  async get(token: string): Promise<AccessTokenInfo | undefined> {
+    const entry = await this.backend.get<AccessTokenInfo>(ACCESS_TOKEN_PREFIX + token);
+    if (!entry) return undefined;
+    if (entry.expiresAt <= epochSeconds()) {
+      await this.delete(token);
+      return undefined;
+    }
+    return entry;
+  }
+
+  async delete(token: string): Promise<void> {
+    await this.backend.delete(ACCESS_TOKEN_PREFIX + token);
+  }
+
+  async revokeByGrantId(grantId: string): Promise<void> {
+    const entries = await this.backend.list<AccessTokenInfo>(ACCESS_TOKEN_PREFIX);
+    await Promise.all(
+      entries
+        .filter((entry) => entry.value.grantId === grantId)
+        .map((entry) => this.backend.delete(entry.key)),
+    );
+  }
+
+  async revoke(token: string): Promise<void> {
+    await this.delete(token);
+  }
+}
+
+class JsonRefreshTokenStore implements RefreshTokenStorage {
+  constructor(private readonly backend: JsonStoreBackend) {}
+
+  async set(token: string, info: RefreshTokenInfo): Promise<void> {
+    await this.backend.put(REFRESH_TOKEN_PREFIX + token, info, ttlUntil(info.expiresAt));
+  }
+
+  async get(token: string): Promise<RefreshTokenInfo | undefined> {
+    const entry = await this.backend.get<RefreshTokenInfo>(REFRESH_TOKEN_PREFIX + token);
+    if (!entry) return undefined;
+    if (entry.expiresAt <= epochSeconds()) {
+      await this.delete(token);
+      return undefined;
+    }
+    return entry;
+  }
+
+  async consume(token: string): Promise<void> {
+    const entry = await this.get(token);
+    if (!entry) return;
+    await this.set(token, { ...entry, used: true });
+  }
+
+  async delete(token: string): Promise<void> {
+    await this.backend.delete(REFRESH_TOKEN_PREFIX + token);
+  }
+
+  async revokeByGrantId(grantId: string): Promise<void> {
+    const entries = await this.backend.list<RefreshTokenInfo>(REFRESH_TOKEN_PREFIX);
+    await Promise.all(
+      entries
+        .filter((entry) => entry.value.grantId === grantId)
+        .map((entry) => this.backend.delete(entry.key)),
+    );
+  }
+
+  async revoke(token: string): Promise<void> {
+    await this.delete(token);
+  }
+}
+
+class JsonAuthSessionStore implements AuthSessionStorage {
+  constructor(private readonly backend: JsonStoreBackend) {}
+
+  async set(transactionId: string, info: AuthSessionInfo): Promise<void> {
+    await this.backend.put(AUTH_SESSION_PREFIX + transactionId, info);
+  }
+
+  async get(transactionId: string): Promise<AuthSessionInfo | undefined> {
+    return (await this.backend.get<AuthSessionInfo>(AUTH_SESSION_PREFIX + transactionId)) ?? undefined;
+  }
+
+  async delete(transactionId: string): Promise<void> {
+    await this.backend.delete(AUTH_SESSION_PREFIX + transactionId);
+  }
+}
+
+class JsonBrowserSessionStore implements BrowserSessionStorage {
+  constructor(private readonly backend: JsonStoreBackend) {}
+
+  async set(sessionId: string, info: BrowserSessionInfo): Promise<void> {
+    await this.backend.put(BROWSER_SESSION_PREFIX + sessionId, info);
+  }
+
+  async get(sessionId: string): Promise<BrowserSessionInfo | undefined> {
+    return (await this.backend.get<BrowserSessionInfo>(BROWSER_SESSION_PREFIX + sessionId)) ?? undefined;
+  }
+
+  async delete(sessionId: string): Promise<void> {
+    await this.backend.delete(BROWSER_SESSION_PREFIX + sessionId);
+  }
+}
+
+interface StoredConsent {
+  scopes: string[];
+  grantIds: string[];
+}
+
+class JsonConsentStore implements ConsentStorage {
+  constructor(private readonly backend: JsonStoreBackend) {}
+
+  async grant(subject: string, clientId: string, scopes: string[]): Promise<void> {
+    const key = consentKey(subject, clientId);
+    const current = await this.read(key);
+    await this.backend.put(key, {
+      scopes: [...new Set([...current.scopes, ...scopes])],
+      grantIds: current.grantIds,
+    });
+  }
+
+  async hasConsent(subject: string, clientId: string, scopes: string[]): Promise<boolean> {
+    const current = await this.read(consentKey(subject, clientId));
+    return scopes.every((scope) => current.scopes.includes(scope));
+  }
+
+  async recordGrant(subject: string, clientId: string, grantId: string): Promise<void> {
+    const key = consentKey(subject, clientId);
+    const current = await this.read(key);
+    await this.backend.put(key, {
+      scopes: current.scopes,
+      grantIds: [...new Set([...current.grantIds, grantId])],
+    });
+  }
+
+  async revoke(subject: string, clientId: string): Promise<string[]> {
+    const key = consentKey(subject, clientId);
+    const current = await this.read(key);
+    await this.backend.delete(key);
+    return current.grantIds;
+  }
+
+  private async read(key: string): Promise<StoredConsent> {
+    return (await this.backend.get<StoredConsent>(key)) ?? { scopes: [], grantIds: [] };
+  }
+}
+
+type StoredUser = UserClaims & { password: string };
+
+class JsonUserStore implements UserStorage {
+  constructor(private readonly backend: JsonStoreBackend) {}
+
+  async authenticate(username: string, password: string): Promise<StoredUser | undefined> {
+    const user = await this.findOrSeed(username);
+    return user?.password === password ? user : undefined;
+  }
+
+  async getClaims(sub: string): Promise<UserClaims | undefined> {
+    const user = await this.findOrSeed(sub);
+    if (!user) return undefined;
+    const { password: _, ...claims } = user;
+    return claims;
+  }
+
+  private async findOrSeed(username: string): Promise<StoredUser | undefined> {
+    const key = USER_PREFIX + username;
+    const stored = await this.backend.get<StoredUser>(key);
+    if (stored) return stored;
+    const fixture = defaultUserFixture(username);
+    if (!fixture) return undefined;
+    await this.backend.put(key, fixture);
+    return fixture;
+  }
+}
+
+/** Create all OP stores over one deployment-native JSON backend. */
+export function createJsonProviderStores(backend: JsonStoreBackend): ProviderStores {
+  return {
+    transactionStore: new JsonTransactionStore(backend),
+    authCodeStore: new JsonAuthorizationCodeStore(backend),
+    accessTokenStore: new JsonAccessTokenStore(backend),
+    refreshTokenStore: new JsonRefreshTokenStore(backend),
+    authSessionStore: new JsonAuthSessionStore(backend),
+    browserSessionStore: new JsonBrowserSessionStore(backend),
+    consentStore: new JsonConsentStore(backend),
+    userStore: new JsonUserStore(backend),
+  };
+}
+
+function epochSeconds(): number {
+  return Math.floor(Date.now() / 1000);
+}
+
+function ttlUntil(expiresAt: number): number {
+  return Math.max(1, expiresAt - epochSeconds());
+}
+
+function consentKey(subject: string, clientId: string): string {
+  return CONSENT_PREFIX + encodeURIComponent(subject) + ':' + encodeURIComponent(clientId);
+}
+
+function defaultUserFixture(username: string): StoredUser | undefined {
+  if (username === 'testuser') {
+    return {
+      sub: 'testuser',
+      name: 'Test User',
+      family_name: 'User',
+      given_name: 'Test',
+      middle_name: 'Q',
+      nickname: 'testy',
+      preferred_username: 'testuser',
+      profile: 'https://op.example.com/users/testuser',
+      picture: 'https://op.example.com/users/testuser/avatar.png',
+      website: 'https://testuser.example.com',
+      gender: 'unspecified',
+      birthdate: '1990-01-01',
+      zoneinfo: 'Asia/Tokyo',
+      locale: 'en-US',
+      updated_at: 1700000000,
+      email: 'test@example.com',
+      email_verified: true,
+      address: {
+        formatted: '100 Test Street, Test City, TS 10000, JP',
+        street_address: '100 Test Street',
+        locality: 'Test City',
+        region: 'TS',
+        postal_code: '10000',
+        country: 'JP',
+      },
+      phone_number: '+81-3-0000-0000',
+      phone_number_verified: true,
+      password: 'password',
+    };
+  }
+  if (username === 'otheruser') {
+    return {
+      sub: 'otheruser',
+      name: 'Other User',
+      preferred_username: 'otheruser',
+      email: 'other@example.com',
+      email_verified: true,
+      password: 'password',
+    };
+  }
+  return undefined;
+}
+
 // Singleton store instances.
 //
 // Backed by globalThis so a single instance is shared process-wide. This is
@@ -838,19 +1269,10 @@ export class UserStore {
 // versa. It also survives dev-mode hot reloads. Harmless for single-layer
 // runtimes (Node / Hono / Express / Fastify), which always see one instance.
 const storeRegistry = globalThis as typeof globalThis & {
-  __oidcProviderStores?: {
-    transactionStore: InMemoryTransactionStore;
-    authCodeStore: AuthorizationCodeStore;
-    accessTokenStore: AccessTokenStore;
-    refreshTokenStore: RefreshTokenStore;
-    authSessionStore: AuthSessionStore;
-    browserSessionStore: BrowserSessionStore;
-    consentStore: ConsentStore;
-    userStore: UserStore;
-  };
+  __oidcProviderStores?: ProviderStores;
 };
 
-const stores = (storeRegistry.__oidcProviderStores ??= {
+export const defaultProviderStores = (storeRegistry.__oidcProviderStores ??= {
   transactionStore: new InMemoryTransactionStore(),
   authCodeStore: new AuthorizationCodeStore(),
   accessTokenStore: new AccessTokenStore(),
@@ -861,14 +1283,14 @@ const stores = (storeRegistry.__oidcProviderStores ??= {
   userStore: new UserStore(),
 });
 
-export const transactionStore = stores.transactionStore;
-export const authCodeStore = stores.authCodeStore;
-export const accessTokenStore = stores.accessTokenStore;
-export const refreshTokenStore = stores.refreshTokenStore;
-export const authSessionStore = stores.authSessionStore;
-export const browserSessionStore = stores.browserSessionStore;
-export const consentStore = stores.consentStore;
-export const userStore = stores.userStore;
+export const transactionStore = defaultProviderStores.transactionStore;
+export const authCodeStore = defaultProviderStores.authCodeStore;
+export const accessTokenStore = defaultProviderStores.accessTokenStore;
+export const refreshTokenStore = defaultProviderStores.refreshTokenStore;
+export const authSessionStore = defaultProviderStores.authSessionStore;
+export const browserSessionStore = defaultProviderStores.browserSessionStore;
+export const consentStore = defaultProviderStores.consentStore;
+export const userStore = defaultProviderStores.userStore;
 `;
 }
 
@@ -891,71 +1313,79 @@ export function resolversTemplate(
 `
     : '';
   const refreshTokenResolverBlock = features.refreshToken
-    ? `/**
- * Refresh Token Resolver for Token Endpoint.
- * OAuth 2.1 Section 4.3
- */
-export const refreshTokenResolver: RefreshTokenResolver = {
-  async resolve(token: string): Promise<RefreshTokenInfo | null> {
-    return refreshTokenStore.get(token) ?? null;
-  },
-  async revokeRefreshToken(token: string): Promise<void> {
-    refreshTokenStore.consume(token);
-  },
-  // OAuth 2.1 Section 4.3.1: refresh token の再利用を検知した時は同 grant の
-  // AT/RT をすべて失効する SHOULD。
-  async revokeTokensByGrantId(grantId: string): Promise<void> {
-    accessTokenStore.revokeByGrantId(grantId);
-    refreshTokenStore.revokeByGrantId(grantId);
-  },
-};
+    ? `  const refreshTokenResolver: RefreshTokenResolver = {
+    async resolve(token: string): Promise<RefreshTokenInfo | null> {
+      return (await refreshTokenStore.get(token)) ?? null;
+    },
+    async revokeRefreshToken(token: string): Promise<void> {
+      await refreshTokenStore.consume(token);
+    },
+    async revokeTokensByGrantId(grantId: string): Promise<void> {
+      await accessTokenStore.revokeByGrantId(grantId);
+      await refreshTokenStore.revokeByGrantId(grantId);
+    },
+  };
 
+`
+    : '';
+  const refreshReturnField = features.refreshToken ? `    refreshTokenResolver,
+` : '';
+  const refreshExport = features.refreshToken
+    ? `export const refreshTokenResolver = defaultStoreResolvers.refreshTokenResolver;
 `
     : '';
   const introspectionResolversBlock = features.introspection
-    ? `/**
- * Resolvers for RFC 7662 Token Introspection.
- * Reuses the same in-memory stores as UserInfo / token rotation.
- */
-export const introspectionAccessTokenResolver: IntrospectionAccessTokenResolver = {
-  async findAccessToken(token) {
-    return accessTokenStore.get(token) ?? null;
-  },
-};
+    ? `  const introspectionAccessTokenResolver: IntrospectionAccessTokenResolver = {
+    async findAccessToken(token) {
+      return (await accessTokenStore.get(token)) ?? null;
+    },
+  };
 
-export const introspectionRefreshTokenResolver: IntrospectionRefreshTokenResolver = {
-  async resolve(token) {
-    return refreshTokenStore.get(token) ?? null;
-  },
-};
+  const introspectionRefreshTokenResolver: IntrospectionRefreshTokenResolver = {
+    async resolve(token) {
+      return (await refreshTokenStore.get(token)) ?? null;
+    },
+  };
 
 `
     : '';
+  const introspectionReturnFields = features.introspection
+    ? `    introspectionAccessTokenResolver,
+    introspectionRefreshTokenResolver,
+`
+    : '';
+  const introspectionExports = features.introspection
+    ? `export const introspectionAccessTokenResolver =
+  defaultStoreResolvers.introspectionAccessTokenResolver;
+export const introspectionRefreshTokenResolver =
+  defaultStoreResolvers.introspectionRefreshTokenResolver;
+`
+    : '';
   const revocationResolversBlock = features.revocation
-    ? `/**
- * Resolvers for RFC 7009 Token Revocation.
- *
- * RFC 7009 Section 2.1 SHOULD: revoking a refresh token also revokes all
- * access tokens that share the same grantId.
- */
-export const revocationResolvers: RevocationTokenResolvers = {
-  async findAccessToken(token) {
-    return accessTokenStore.get(token) ?? null;
-  },
-  async revokeAccessToken(token) {
-    accessTokenStore.revoke(token);
-  },
-  async findRefreshToken(token) {
-    return refreshTokenStore.get(token) ?? null;
-  },
-  async revokeRefreshToken(token) {
-    refreshTokenStore.revoke(token);
-  },
-  async revokeAccessTokensByGrantId(grantId) {
-    accessTokenStore.revokeByGrantId(grantId);
-  },
-};
+    ? `  const revocationResolvers: RevocationTokenResolvers = {
+    async findAccessToken(token) {
+      return (await accessTokenStore.get(token)) ?? null;
+    },
+    async revokeAccessToken(token) {
+      await accessTokenStore.revoke(token);
+    },
+    async findRefreshToken(token) {
+      return (await refreshTokenStore.get(token)) ?? null;
+    },
+    async revokeRefreshToken(token) {
+      await refreshTokenStore.revoke(token);
+    },
+    async revokeAccessTokensByGrantId(grantId) {
+      await accessTokenStore.revokeByGrantId(grantId);
+    },
+  };
 
+`
+    : '';
+  const revocationReturnField = features.revocation ? `    revocationResolvers,
+` : '';
+  const revocationExport = features.revocation
+    ? `export const revocationResolvers = defaultStoreResolvers.revocationResolvers;
 `
     : '';
   return `import type {
@@ -973,13 +1403,9 @@ ${introspectionTypeImports}${revocationTypeImports}  SessionResolver,
 } from '${corePkg}';
 import { createInMemoryClientResolver } from './config.js';
 import {
-  authCodeStore,
-  accessTokenStore,
-  refreshTokenStore,
-  userStore,
-  browserSessionStore,
-  consentStore,
+  defaultProviderStores,
   parseSessionId,
+  type ProviderStores,
 } from './store.js';
 
 /**
@@ -992,96 +1418,101 @@ export const clientResolver: ClientResolver & TokenClientResolver =
 export const tokenClientResolver: TokenClientResolver = clientResolver;
 
 /**
- * Authorization Code Resolver for Token Endpoint.
- */
-export const authorizationCodeResolver: AuthorizationCodeResolver = {
-  async findAuthorizationCode(code: string): Promise<AuthorizationCodeInfo | null> {
-    const entry = authCodeStore.get(code);
-    if (!entry) return null;
-    return entry;
-  },
-  async revokeAuthorizationCode(code: string): Promise<void> {
-    authCodeStore.consume(code);
-  },
-  // OAuth 2.1 Section 4.1.2 / RFC 6749 Section 4.1.2:
-  // SHOULD revoke all tokens previously issued from a reused authorization code.
-  async revokeTokensByGrantId(grantId: string): Promise<void> {
-    accessTokenStore.revokeByGrantId(grantId);
-    refreshTokenStore.revokeByGrantId(grantId);
-  },
-};
-
-/**
- * Access Token Resolver for UserInfo Endpoint.
- */
-export const accessTokenResolver: AccessTokenResolver = {
-  async findAccessToken(token: string): Promise<AccessTokenInfo | null> {
-    return accessTokenStore.get(token) ?? null;
-  },
-};
-
-${refreshTokenResolverBlock}/**
- * User Claims Resolver for UserInfo Endpoint.
- */
-export const userClaimsResolver: UserClaimsResolver = {
-  async findUserClaims(sub: string): Promise<UserClaims | null> {
-    return userStore.getClaims(sub) ?? null;
-  },
-};
-
-${introspectionResolversBlock}${revocationResolversBlock}/**
- * Default session resolver: reads the browser session cookie and looks up the
- * active OP session (OIDC Core 1.0 Section 3.1.2.3). This is what enables SSO
- * and silent authentication (prompt=none) across authorization requests.
- */
-export const sessionResolver: SessionResolver = {
-  async resolve(request: Request): Promise<SessionInfo | null> {
-    const sessionId = parseSessionId(request.headers.get('Cookie'));
-    if (!sessionId) return null;
-    const session = browserSessionStore.get(sessionId);
-    if (!session) return null;
-    return { subject: session.subject, authTime: session.authTime };
-  },
-};
-
-/**
- * Default consent resolver backed by the in-memory consent store.
- * OIDC Core 1.0 Section 3.1.2.1: prompt=none must reject with consent_required
- * when consent has not been previously granted.
+ * Build the resolver suite over one coherent store set. A request must never
+ * mix resolvers from one backend with direct stores from another backend.
  */
 export type GrantAwareConsentResolver = ConsentResolver & {
   recordGrant(subject: string, clientId: string, grantId: string): Promise<void>;
 };
 
-/**
- * User-facing "remove access" coordinator. The consent index is cleared first,
- * then every grant family for that subject/client is synchronously revoked.
- * Production stores must provide strongly consistent reads for this operation so
- * prompt=none and token use cannot observe stale consent or stale tokens.
- */
-export async function revokeConsentAndTokens(subject: string, clientId: string): Promise<void> {
-  const grantIds = consentStore.revoke(subject, clientId);
-  for (const grantId of grantIds) {
-    await authorizationCodeResolver.revokeTokensByGrantId?.(grantId);
-  }
+export function createStoreResolvers(stores: ProviderStores) {
+  const {
+    authCodeStore,
+    accessTokenStore,
+    refreshTokenStore,
+    userStore,
+    browserSessionStore,
+    consentStore,
+  } = stores;
+
+  const authorizationCodeResolver: AuthorizationCodeResolver = {
+    async findAuthorizationCode(code: string): Promise<AuthorizationCodeInfo | null> {
+      return (await authCodeStore.get(code)) ?? null;
+    },
+    async revokeAuthorizationCode(code: string): Promise<void> {
+      await authCodeStore.consume(code);
+    },
+    async revokeTokensByGrantId(grantId: string): Promise<void> {
+      await accessTokenStore.revokeByGrantId(grantId);
+      await refreshTokenStore.revokeByGrantId(grantId);
+    },
+  };
+
+  const accessTokenResolver: AccessTokenResolver = {
+    async findAccessToken(token: string): Promise<AccessTokenInfo | null> {
+      return (await accessTokenStore.get(token)) ?? null;
+    },
+  };
+
+${refreshTokenResolverBlock}  const userClaimsResolver: UserClaimsResolver = {
+    async findUserClaims(sub: string): Promise<UserClaims | null> {
+      return (await userStore.getClaims(sub)) ?? null;
+    },
+  };
+
+${introspectionResolversBlock}${revocationResolversBlock}  const sessionResolver: SessionResolver = {
+    async resolve(request: Request): Promise<SessionInfo | null> {
+      const sessionId = parseSessionId(request.headers.get('Cookie'));
+      if (!sessionId) return null;
+      const session = await browserSessionStore.get(sessionId);
+      if (!session) return null;
+      return { subject: session.subject, authTime: session.authTime };
+    },
+  };
+
+  const revokeConsentAndTokens = async (subject: string, clientId: string): Promise<void> => {
+    const grantIds = await consentStore.revoke(subject, clientId);
+    for (const grantId of grantIds) {
+      await authorizationCodeResolver.revokeTokensByGrantId?.(grantId);
+    }
+  };
+
+  const consentResolver: GrantAwareConsentResolver = {
+    async hasConsent(subject: string, clientId: string, scopes: string[]): Promise<boolean> {
+      return consentStore.hasConsent(subject, clientId, scopes);
+    },
+    async recordConsent(subject: string, clientId: string, scopes: string[]): Promise<void> {
+      await consentStore.grant(subject, clientId, scopes);
+    },
+    async recordGrant(subject: string, clientId: string, grantId: string): Promise<void> {
+      await consentStore.recordGrant(subject, clientId, grantId);
+    },
+    async revokeConsent(subject: string, clientId: string): Promise<void> {
+      await revokeConsentAndTokens(subject, clientId);
+    },
+  };
+
+  return {
+    authorizationCodeResolver,
+    accessTokenResolver,
+${refreshReturnField}    userClaimsResolver,
+${introspectionReturnFields}${revocationReturnField}    sessionResolver,
+    consentResolver,
+    revokeConsentAndTokens,
+  };
 }
 
-export const consentResolver: GrantAwareConsentResolver = {
-  async hasConsent(subject: string, clientId: string, scopes: string[]): Promise<boolean> {
-    return consentStore.hasConsent(subject, clientId, scopes);
-  },
-  // OIDC Core 1.0 Section 3.1.2.4: record the user's consent so a later
-  // prompt=none (or non-interactive) request can confirm it without UI.
-  async recordConsent(subject: string, clientId: string, scopes: string[]): Promise<void> {
-    consentStore.grant(subject, clientId, scopes);
-  },
-  async recordGrant(subject: string, clientId: string, grantId: string): Promise<void> {
-    consentStore.recordGrant(subject, clientId, grantId);
-  },
-  async revokeConsent(subject: string, clientId: string): Promise<void> {
-    await revokeConsentAndTokens(subject, clientId);
-  },
-};
+const defaultStoreResolvers = createStoreResolvers(defaultProviderStores);
+
+export const authorizationCodeResolver = defaultStoreResolvers.authorizationCodeResolver;
+export const accessTokenResolver = defaultStoreResolvers.accessTokenResolver;
+${refreshExport}export const userClaimsResolver = defaultStoreResolvers.userClaimsResolver;
+${introspectionExports}${revocationExport}export const sessionResolver = defaultStoreResolvers.sessionResolver;
+export const consentResolver = defaultStoreResolvers.consentResolver;
+
+export async function revokeConsentAndTokens(subject: string, clientId: string): Promise<void> {
+  await defaultStoreResolvers.revokeConsentAndTokens(subject, clientId);
+}
 `;
 }
 
@@ -2556,7 +2987,7 @@ loginApp.post('/', async (c) => {
   if (loginPromptValues.includes('login') || loginPromptValues.includes('select_account')) {
     await authSessionStore.delete(transactionId);
     const existingSessionId = parseSessionId(c.req.header('Cookie') ?? null);
-    if (existingSessionId) browserSessionStore.delete(existingSessionId);
+    if (existingSessionId) await browserSessionStore.delete(existingSessionId);
   }
 
   const authTime = Math.floor(Date.now() / 1000);
@@ -2571,7 +3002,7 @@ loginApp.post('/', async (c) => {
   // SSO / prompt=none / max_age work on subsequent authorization requests
   // (OIDC Core 1.0 Section 3.1.2.3).
   const sessionId = await generateRandomString(32);
-  browserSessionStore.set(sessionId, { subject: user.sub, authTime });
+  await browserSessionStore.set(sessionId, { subject: user.sub, authTime });
   c.header('Set-Cookie', buildSessionCookie(sessionId));
 
   // Redirect to consent page
@@ -2742,6 +3173,16 @@ export function applyTemplate(
   const revocationMount = features.revocation
     ? `  app.route('/revoke', revocationApp);\n`
     : '';
+  const refreshStorageContext = features.refreshToken
+    ? `    c.set('refreshTokenResolver', storeResolvers.refreshTokenResolver);\n`
+    : '';
+  const introspectionStorageContext = features.introspection
+    ? `    c.set('introspectionAccessTokenResolver', storeResolvers.introspectionAccessTokenResolver);
+    c.set('introspectionRefreshTokenResolver', storeResolvers.introspectionRefreshTokenResolver);\n`
+    : '';
+  const revocationStorageContext = features.revocation
+    ? `    c.set('revocationResolvers', storeResolvers.revocationResolvers);\n`
+    : '';
   const methodGuard = oidcMethodGuardTemplate(features);
   return `import type { Hono } from 'hono';
 import { cors } from 'hono/cors';
@@ -2758,9 +3199,13 @@ import {
   type ProviderConfig,
 } from './config.js';
 import {
-  sessionResolver as defaultSessionResolver,
-  consentResolver as defaultConsentResolver,
+  createStoreResolvers,
 } from './resolvers.js';
+import {
+  defaultProviderStores,
+  type ProviderStores,
+  type ProviderStoresFactory,
+} from './store.js';
 import { createViews, type Views } from './views.js';
 import {
   assertHasRs256Key,
@@ -2825,6 +3270,8 @@ export interface ApplyOidcOptions {
    * Defaults to the in-memory consent store resolver in resolvers.ts.
    */
   consentResolver?: ConsentResolver;
+  /** Persistent stores, or a request-aware factory for bindings such as Cloudflare D1. */
+  storage?: ProviderStores | ProviderStoresFactory;
   /**
    * acr / amr resolver (OIDC Core 1.0 §2 / §12.1).
    * Host application が認証ポリシーに合わせて acr / amr を返す。
@@ -2936,6 +3383,8 @@ ${introspectionCors}${revocationCors}  app.use('/.well-known/openid-configuratio
     const { privateKey, publicJwk, keyId } = signingKey;
     const clientResolver =
       options.clientResolver ?? createInMemoryClientResolver();
+    const stores = await resolveProviderStores(options.storage, c);
+    const storeResolvers = createStoreResolvers(stores);
 
     // Backward-compatible aliases (primary key) — used by jwks/token routes that
     // still read these context vars.
@@ -2957,6 +3406,18 @@ ${introspectionCors}${revocationCors}  app.use('/.well-known/openid-configuratio
     c.set('config', createProviderConfig(options.config));
     c.set('clientResolver', clientResolver);
     c.set('tokenClientResolver', options.tokenClientResolver ?? clientResolver);
+    c.set('transactionStore', stores.transactionStore);
+    c.set('authCodeStore', stores.authCodeStore);
+    c.set('accessTokenStore', stores.accessTokenStore);
+    c.set('refreshTokenStore', stores.refreshTokenStore);
+    c.set('authSessionStore', stores.authSessionStore);
+    c.set('browserSessionStore', stores.browserSessionStore);
+    c.set('authenticateUser', (username: string, password: string) =>
+      stores.userStore.authenticate(username, password));
+    c.set('authCodeResolver', storeResolvers.authorizationCodeResolver);
+    c.set('accessTokenResolver', storeResolvers.accessTokenResolver);
+    c.set('userClaimsResolver', storeResolvers.userClaimsResolver);
+${refreshStorageContext}${introspectionStorageContext}${revocationStorageContext}
     // T-015: acr / amr resolver (optional; undefined preserves T-009 hold behavior).
     if (options.acrResolver) {
       c.set('acrResolver', options.acrResolver);
@@ -2967,8 +3428,8 @@ ${introspectionCors}${revocationCors}  app.use('/.well-known/openid-configuratio
     c.set('jwksProvider', options.jwksProvider ?? (() => signingKeysToJwkSet(idTokenSigningKeys)));
     // P1: default cookie-based session + consent resolvers so prompt=none /
     // max_age / SSO work out of the box (OIDC Core 1.0 Section 3.1.2.1 / 3.1.2.3).
-    c.set('sessionResolver', options.sessionResolver ?? defaultSessionResolver);
-    c.set('consentResolver', options.consentResolver ?? defaultConsentResolver);
+    c.set('sessionResolver', options.sessionResolver ?? storeResolvers.sessionResolver);
+    c.set('consentResolver', options.consentResolver ?? storeResolvers.consentResolver);
     // Inject custom UI (login / consent / error) merged over the defaults.
     c.set('views', createViews(options.views));
     await next();
@@ -2981,6 +3442,14 @@ ${introspectionMount}${revocationMount}  app.route('/.well-known/jwks.json', jwk
   app.route('/.well-known/openid-configuration', discoveryApp);
   app.route('/login', loginApp);
   app.route('/consent', consentApp);
+}
+
+async function resolveProviderStores(
+  storage: ApplyOidcOptions['storage'],
+  context: any,
+): Promise<ProviderStores> {
+  if (!storage) return defaultProviderStores;
+  return typeof storage === 'function' ? storage(context) : storage;
 }
 `;
 }
@@ -4898,6 +5367,44 @@ export function consentWithdrawalConformanceBlock(features: OidcFeatureConfig): 
 `;
 }
 
+export function persistentStorageConformanceBlock(): string {
+  return `  describe('Persistent storage contract', () => {
+    it('should share state across provider store instances backed by the same backend', async () => {
+      const values = new Map<string, unknown>();
+      const backend: JsonStoreBackend = {
+        async get<T>(key: string): Promise<T | null> {
+          return (values.get(key) as T | undefined) ?? null;
+        },
+        async put<T>(key: string, value: T): Promise<void> {
+          values.set(key, value);
+        },
+        async delete(key: string): Promise<void> {
+          values.delete(key);
+        },
+        async list<T>(prefix: string): Promise<Array<{ key: string; value: T }>> {
+          return [...values.entries()]
+            .filter(([key]) => key.startsWith(prefix))
+            .map(([key, value]) => ({ key, value: value as T }));
+        },
+      };
+      const writerStores = createJsonProviderStores(backend);
+      await writerStores.authSessionStore.set('persistent-transaction', {
+        subject: 'testuser',
+        authTime: 1700000000,
+      });
+
+      const readerStores = createJsonProviderStores(backend);
+
+      expect(await readerStores.authSessionStore.get('persistent-transaction')).toEqual({
+        subject: 'testuser',
+        authTime: 1700000000,
+      });
+    });
+  });
+
+`;
+}
+
 export function conformanceTestTemplate(
   corePkg: string,
   features: OidcFeatureConfig = DEFAULT_FEATURES,
@@ -4911,7 +5418,7 @@ import { Hono } from 'hono';
 ${exportPublicJwkImport}import { createApp, validateSigningKeySet } from './app.js';
 import { applyOidc } from './apply.js';
 import { createInMemoryClientResolver, type RegisteredClient } from './config.js';
-import { accessTokenStore, authSessionStore, consentStore, refreshTokenStore, transactionStore } from './store.js';
+import { accessTokenStore, authSessionStore, consentStore, createJsonProviderStores, refreshTokenStore, transactionStore, type JsonStoreBackend } from './store.js';
 import { consentResolver } from './resolvers.js';
 import { defaultViews } from './views.js';
 import { renderView } from './views.js';
@@ -4973,6 +5480,7 @@ ${requestObjectConformanceBeforeAll(features)}
 });
 
 describe('generated provider HTTP conformance', () => {
+${persistentStorageConformanceBlock()}
   describe('Generated view rendering', () => {
     it('should HTML-escape every login and consent value', () => {
       const hostile = '\"><script>alert(1)</script>';

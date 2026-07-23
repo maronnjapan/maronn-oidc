@@ -3,6 +3,7 @@
  * OIDC Core 1.0 Section 3.1.2 / OAuth 2.1 に準拠
  */
 import { sanitizeErrorDescription } from './error-utils';
+import { isLoopbackHostname } from './loopback';
 import { parseRequestObject, RequestObjectError } from './request-object';
 import type { JwkSet } from './jwks';
 import type { ClaimsParameter, ClaimRequestValue } from './userinfo';
@@ -324,15 +325,6 @@ const CODE_CHALLENGE_S256_LENGTH = 43;
 // base64url alphabet (no padding): [A-Za-z0-9\-_]
 const CODE_CHALLENGE_S256_PATTERN = /^[A-Za-z0-9\-_]+$/;
 
-const LOOPBACK_HOSTS = ['localhost', '127.0.0.1', '[::1]'];
-
-/**
- * ループバックアドレスかどうかを判定する
- */
-function isLoopbackHost(hostname: string): boolean {
-  return LOOPBACK_HOSTS.includes(hostname);
-}
-
 /**
  * redirect_uri をクライアントの登録済みURIと照合する
  * RFC 3986 Section 6.2.1 の Simple String Comparison を使用
@@ -358,12 +350,12 @@ function matchRedirectUri(
   // ループバックアドレスの場合、ポート番号の違いを許容
   try {
     const requestUrl = new URL(requestUri);
-    if (isLoopbackHost(requestUrl.hostname)) {
+    if (isLoopbackHostname(requestUrl.hostname)) {
       return registeredUris.some((registeredUri) => {
         try {
           const registeredUrl = new URL(registeredUri);
           return (
-            isLoopbackHost(registeredUrl.hostname) &&
+            isLoopbackHostname(registeredUrl.hostname) &&
             requestUrl.protocol === registeredUrl.protocol &&
             requestUrl.hostname === registeredUrl.hostname &&
             requestUrl.pathname === registeredUrl.pathname &&
@@ -428,7 +420,7 @@ export function validateRegisteredRedirectUris(registeredUris: string[]): void {
       );
     }
 
-    // http:// はループバック（localhost / 127.0.0.1 / [::1]）以外を拒否する
+    // http:// はループバック（localhost / 127.0.0.0/8 / [::1]）以外を拒否する
     if (scheme === 'http:') {
       let parsed: URL;
       try {
@@ -439,7 +431,7 @@ export function validateRegisteredRedirectUris(registeredUris: string[]): void {
           `Registered redirect_uri is not a valid URL: ${uri}`
         );
       }
-      if (!isLoopbackHost(parsed.hostname)) {
+      if (!isLoopbackHostname(parsed.hostname)) {
         throw new AuthorizationError(
           AuthorizationErrorCode.ServerError,
           `Registered redirect_uri must use https:// or loopback http:// — got ${uri}`

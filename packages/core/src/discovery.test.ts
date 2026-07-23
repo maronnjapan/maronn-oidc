@@ -162,6 +162,11 @@ describe('buildProviderMetadata', () => {
       expect(() => buildProviderMetadata(config)).not.toThrow();
     });
 
+    it('should allow issuer with any IPv4 loopback address for development', () => {
+      const config = createValidConfig({ issuer: 'http://127.0.0.2:3000' });
+      expect(() => buildProviderMetadata(config)).not.toThrow();
+    });
+
     it('should throw when issuer contains query parameters', () => {
       const config = createValidConfig({ issuer: 'https://example.com?foo=bar' });
       expect(() => buildProviderMetadata(config)).toThrow();

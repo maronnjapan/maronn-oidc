@@ -10,7 +10,7 @@ const clientBaseURL =
 const resourceServerURL =
   process.env.E2E_RESOURCE_SERVER_URL ?? `http://${host}:${resourceServerPort}`;
 const opPackage =
-  process.env.E2E_OP_PACKAGE ?? '@maronn-oidc/sample-hono';
+  process.env.E2E_OP_PACKAGE ?? '@maronn-oidc/sample-hono-cloudflare';
 const oidcClientsJson = JSON.stringify([
   {
     clientId: 'e2e-client',
@@ -64,6 +64,12 @@ export default defineConfig({
         RESOURCE_SERVER_CLIENT_ID: 'e2e-resource-server',
         RESOURCE_SERVER_CLIENT_SECRET: 'e2e-resource-server-secret',
         RESOURCE_SERVER_REDIRECT_URI: `${resourceServerURL}/unused-callback`,
+        ...(process.env.OIDC_SQLITE_PATH
+          ? { OIDC_SQLITE_PATH: process.env.OIDC_SQLITE_PATH }
+          : {}),
+        ...(process.env.OIDC_D1_PERSIST_PATH
+          ? { OIDC_D1_PERSIST_PATH: process.env.OIDC_D1_PERSIST_PATH }
+          : {}),
       },
     },
     {

@@ -4,6 +4,7 @@
  */
 
 import { getJwaAlgorithm } from './crypto-utils';
+import { isLoopbackHostname } from './loopback';
 import { assertHasRs256Key } from './signing-key';
 
 /**
@@ -118,7 +119,7 @@ export interface ProviderMetadata {
 
 /**
  * Validate issuer per OIDC Discovery Section 3:
- * - MUST use https scheme (except localhost for development)
+ * - MUST use https scheme (except loopback hosts for development)
  * - MUST NOT contain query parameters
  * - MUST NOT contain fragments
  */
@@ -134,11 +135,8 @@ function validateIssuer(issuer: string): void {
     throw new Error(`issuer must be a valid URL: ${issuer}`);
   }
 
-  const isLocalhost =
-    url.hostname === 'localhost' || url.hostname === '127.0.0.1';
-
-  if (url.protocol !== 'https:' && !isLocalhost) {
-    throw new Error('issuer must use https scheme (except localhost)');
+  if (url.protocol !== 'https:' && !isLoopbackHostname(url.hostname)) {
+    throw new Error('issuer must use https scheme (except loopback hosts)');
   }
 
   if (url.search) {

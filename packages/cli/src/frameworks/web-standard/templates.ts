@@ -16,6 +16,7 @@ import {
   jwksRouteTemplate,
   loginRouteTemplate,
   pkceDisabledConformanceBlock,
+  persistentStorageConformanceBlock,
   requestObjectConformanceBeforeAll,
   requestObjectConformanceModuleSetup,
   resolversTemplate,
@@ -375,6 +376,16 @@ export function webAppTemplate(
   const revocationMount = features.revocation
     ? `  app.route('/revoke', revocationApp);\n`
     : '';
+  const refreshStorageContext = features.refreshToken
+    ? `    c.set('refreshTokenResolver', storeResolvers.refreshTokenResolver);\n`
+    : '';
+  const introspectionStorageContext = features.introspection
+    ? `    c.set('introspectionAccessTokenResolver', storeResolvers.introspectionAccessTokenResolver);
+    c.set('introspectionRefreshTokenResolver', storeResolvers.introspectionRefreshTokenResolver);\n`
+    : '';
+  const revocationStorageContext = features.revocation
+    ? `    c.set('revocationResolvers', storeResolvers.revocationResolvers);\n`
+    : '';
   return `import { WebRouter, type WebMiddleware } from './web-router.js';
 import { authorizeApp } from './routes/authorize.js';
 import { tokenApp } from './routes/token.js';
@@ -389,9 +400,12 @@ import {
   type ProviderConfig,
 } from './config.js';
 import {
-  sessionResolver as defaultSessionResolver,
-  consentResolver as defaultConsentResolver,
+  createStoreResolvers,
 } from './resolvers.js';
+import {
+  defaultProviderStores,
+  type ProviderStores,
+} from './store.js';
 import { createViews, type Views } from './views.js';
 import {
   assertHasRs256Key,
@@ -422,6 +436,8 @@ export interface OidcProviderOptions {
   tokenClientResolver?: TokenClientResolver;
   sessionResolver?: SessionResolver;
   consentResolver?: ConsentResolver;
+  /** Persistent stores shared by Route Handlers and Server Actions. */
+  storage?: ProviderStores;
   acrResolver?: AcrResolver;
   jwksProvider?: () => Promise<JwkSet> | JwkSet;
   corsOrigins?: CorsOrigins;
@@ -491,6 +507,8 @@ ${introspectionCors}${revocationCors}  app.use('/.well-known/openid-configuratio
     const { privateKey, publicJwk, keyId } = signingKey;
     const clientResolver =
       options.clientResolver ?? createInMemoryClientResolver();
+    const stores = options.storage ?? defaultProviderStores;
+    const storeResolvers = createStoreResolvers(stores);
 
     c.set('privateKey', privateKey);
     c.set('publicJwk', publicJwk);
@@ -507,6 +525,18 @@ ${introspectionCors}${revocationCors}  app.use('/.well-known/openid-configuratio
     c.set('config', createProviderConfig(options.config));
     c.set('clientResolver', clientResolver);
     c.set('tokenClientResolver', options.tokenClientResolver ?? clientResolver);
+    c.set('transactionStore', stores.transactionStore);
+    c.set('authCodeStore', stores.authCodeStore);
+    c.set('accessTokenStore', stores.accessTokenStore);
+    c.set('refreshTokenStore', stores.refreshTokenStore);
+    c.set('authSessionStore', stores.authSessionStore);
+    c.set('browserSessionStore', stores.browserSessionStore);
+    c.set('authenticateUser', (username: string, password: string) =>
+      stores.userStore.authenticate(username, password));
+    c.set('authCodeResolver', storeResolvers.authorizationCodeResolver);
+    c.set('accessTokenResolver', storeResolvers.accessTokenResolver);
+    c.set('userClaimsResolver', storeResolvers.userClaimsResolver);
+${refreshStorageContext}${introspectionStorageContext}${revocationStorageContext}
     if (options.acrResolver) {
       c.set('acrResolver', options.acrResolver);
     }
@@ -514,8 +544,8 @@ ${introspectionCors}${revocationCors}  app.use('/.well-known/openid-configuratio
     // 署名鍵セットを既定として使い、OP が発行した ID Token を hint として検証できる
     // ようにする（OIDC Core 1.0 §3.1.2.2）。明示指定があれば優先。
     c.set('jwksProvider', options.jwksProvider ?? (() => signingKeysToJwkSet(idTokenSigningKeys)));
-    c.set('sessionResolver', options.sessionResolver ?? defaultSessionResolver);
-    c.set('consentResolver', options.consentResolver ?? defaultConsentResolver);
+    c.set('sessionResolver', options.sessionResolver ?? storeResolvers.sessionResolver);
+    c.set('consentResolver', options.consentResolver ?? storeResolvers.consentResolver);
     // Inject custom UI (login / consent / error) merged over the defaults.
     c.set('views', createViews(options.views));
     await next();
@@ -724,6 +754,191 @@ function rebaseRequestOrigin(request: Request, issuer: string | undefined): Requ
 `;
 }
 
+export function nextJsStorageBackendTemplate(): string {
+  return `import { mkdirSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
+import {
+  createJsonProviderStores,
+  type JsonStoreBackend,
+  type JsonStoreEntry,
+  type ProviderStores,
+} from './store';
+
+declare const process: { env: Record<string, string | undefined> };
+
+interface StoredRow {
+  key: string;
+  value: string;
+  expires_at: number | null;
+}
+
+class SqliteJsonStoreBackend implements JsonStoreBackend {
+  private readonly database: DatabaseSync;
+
+  constructor(path: string) {
+    const databasePath = path === ':memory:' ? path : resolve(path);
+    if (databasePath !== ':memory:') {
+      mkdirSync(dirname(databasePath), { recursive: true });
+    }
+    this.database = new DatabaseSync(databasePath);
+    this.database.exec('PRAGMA journal_mode = WAL');
+    this.database.exec(
+      'CREATE TABLE IF NOT EXISTS oidc_store (' +
+      'key TEXT PRIMARY KEY, value TEXT NOT NULL, expires_at INTEGER)',
+    );
+  }
+
+  async get<T>(key: string): Promise<T | null> {
+    const row = this.database
+      .prepare('SELECT key, value, expires_at FROM oidc_store WHERE key = ?')
+      .get(key) as unknown as StoredRow | undefined;
+    if (!row) return null;
+    if (row.expires_at !== null && row.expires_at <= Date.now()) {
+      await this.delete(key);
+      return null;
+    }
+    return JSON.parse(row.value) as T;
+  }
+
+  async put<T>(key: string, value: T, ttlSeconds?: number): Promise<void> {
+    const expiresAt = ttlSeconds === undefined ? null : Date.now() + ttlSeconds * 1000;
+    this.database.prepare(
+      'INSERT INTO oidc_store (key, value, expires_at) VALUES (?, ?, ?) ' +
+      'ON CONFLICT(key) DO UPDATE SET value = excluded.value, expires_at = excluded.expires_at',
+    ).run(key, JSON.stringify(value), expiresAt);
+  }
+
+  async delete(key: string): Promise<void> {
+    this.database.prepare('DELETE FROM oidc_store WHERE key = ?').run(key);
+  }
+
+  async list<T>(prefix: string): Promise<Array<JsonStoreEntry<T>>> {
+    const rows = this.database
+      .prepare(
+        'SELECT key, value, expires_at FROM oidc_store ' +
+        'WHERE key >= ? AND key < ? ORDER BY key',
+      )
+      .all(prefix, prefix + '\\uffff') as unknown as StoredRow[];
+    const entries: Array<JsonStoreEntry<T>> = [];
+    for (const row of rows) {
+      if (row.expires_at !== null && row.expires_at <= Date.now()) {
+        await this.delete(row.key);
+      } else {
+        entries.push({ key: row.key, value: JSON.parse(row.value) as T });
+      }
+    }
+    return entries;
+  }
+}
+
+interface UpstashResponse<T> {
+  result?: T;
+  error?: string;
+}
+
+class UpstashRedisJsonStoreBackend implements JsonStoreBackend {
+  constructor(
+    private readonly url: string,
+    private readonly token: string,
+    private readonly namespace = 'maronn-oidc:',
+  ) {}
+
+  async get<T>(key: string): Promise<T | null> {
+    const value = await this.command<string | null>(['GET', this.fullKey(key)]);
+    return value === null ? null : JSON.parse(value) as T;
+  }
+
+  async put<T>(key: string, value: T, ttlSeconds?: number): Promise<void> {
+    const command: Array<string | number> = ['SET', this.fullKey(key), JSON.stringify(value)];
+    if (ttlSeconds !== undefined) command.push('EX', ttlSeconds);
+    await this.command<string>(command);
+  }
+
+  async delete(key: string): Promise<void> {
+    await this.command<number>(['DEL', this.fullKey(key)]);
+  }
+
+  async list<T>(prefix: string): Promise<Array<JsonStoreEntry<T>>> {
+    const keys: string[] = [];
+    let cursor = '0';
+    do {
+      const result = await this.command<[string, string[]]>([
+        'SCAN',
+        cursor,
+        'MATCH',
+        this.fullKey(prefix) + '*',
+        'COUNT',
+        100,
+      ]);
+      cursor = String(result[0]);
+      keys.push(...result[1]);
+    } while (cursor !== '0');
+
+    const entries: Array<JsonStoreEntry<T>> = [];
+    for (const fullKey of keys) {
+      const value = await this.command<string | null>(['GET', fullKey]);
+      if (value !== null) {
+        entries.push({
+          key: fullKey.slice(this.namespace.length),
+          value: JSON.parse(value) as T,
+        });
+      }
+    }
+    return entries;
+  }
+
+  private fullKey(key: string): string {
+    return this.namespace + key;
+  }
+
+  private async command<T>(command: Array<string | number>): Promise<T> {
+    const response = await fetch(this.url, {
+      method: 'POST',
+      headers: {
+        Authorization: 'Bearer ' + this.token,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(command),
+      cache: 'no-store',
+    });
+    const body = await response.json() as UpstashResponse<T>;
+    if (!response.ok || body.error || !('result' in body)) {
+      throw new Error(body.error ?? 'Upstash Redis request failed with HTTP ' + response.status);
+    }
+    return body.result as T;
+  }
+}
+
+const storageRegistry = globalThis as typeof globalThis & {
+  __oidcNextJsProviderStores?: ProviderStores;
+};
+
+export function createNextJsProviderStores(): ProviderStores {
+  return (storageRegistry.__oidcNextJsProviderStores ??= createStores());
+}
+
+function createStores(): ProviderStores {
+  const redisUrl = readEnv('UPSTASH_REDIS_REST_URL');
+  const redisToken = readEnv('UPSTASH_REDIS_REST_TOKEN');
+  if (redisUrl && redisToken) {
+    return createJsonProviderStores(new UpstashRedisJsonStoreBackend(redisUrl, redisToken));
+  }
+  if (readEnv('VERCEL')) {
+    throw new Error(
+      'UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN are required on Vercel',
+    );
+  }
+  const sqlitePath = readEnv('OIDC_SQLITE_PATH') ?? '.data/oidc.sqlite';
+  return createJsonProviderStores(new SqliteJsonStoreBackend(sqlitePath));
+}
+
+function readEnv(name: string): string | undefined {
+  return process.env[name];
+}
+`;
+}
+
 export function nextJsRuntimeTemplate(corePkg: string): string {
   return `import {
   createCachedSigningKeyProvider,
@@ -733,6 +948,7 @@ export function nextJsRuntimeTemplate(corePkg: string): string {
 } from '${corePkg}';
 import { createInMemoryClientResolver, type RegisteredClient } from './config';
 import { createOidcRouteHandlers } from './next';
+import { createNextJsProviderStores } from './storage-backend';
 import type { OidcProviderOptions } from './app';
 
 declare const process: { env: Record<string, string | undefined> } | undefined;
@@ -741,6 +957,7 @@ const signingKeyProvider = createCachedSigningKeyProvider(
   createEphemeralRs256KeyProvider(),
   60_000,
 );
+const providerStores = createNextJsProviderStores();
 
 // OIDC Core 1.0 §2 / §3.1.2.1: when a client requests an acr via \`acr_values\`
 // (or \`claims.id_token.acr.values\`), echo the most-preferred requested value back
@@ -787,6 +1004,7 @@ export function createOidcProviderOptions(): OidcProviderOptions {
     signingKeyProvider,
     clientResolver,
     tokenClientResolver: clientResolver,
+    storage: providerStores,
     acrResolver: sampleAcrResolver,
     corsOrigins: readEnv('OIDC_CORS_ORIGINS') ?? issuer,
   };
@@ -923,8 +1141,12 @@ ${exports}
 
 export function nextJsLoginPageTemplate(corePkg: string): string {
   return `import { getAuthTransaction } from '${corePkg}';
-import { transactionStore } from '../_oidc-provider/store';
+import { oidcProviderOptions } from '../_oidc-provider/runtime';
+import { defaultProviderStores } from '../_oidc-provider/store';
 import { loginAction } from './actions';
+
+const transactionStore =
+  (oidcProviderOptions.storage ?? defaultProviderStores).transactionStore;
 
 // Authorization redirects here with a per-request transaction_id, so the page
 // must always render dynamically (never statically cached).
@@ -1072,13 +1294,15 @@ import {
   handleLoginFailure,
   generateRandomString,
 } from '${corePkg}';
-import {
+import { oidcProviderOptions } from '../_oidc-provider/runtime';
+import { defaultProviderStores, SESSION_COOKIE_NAME } from '../_oidc-provider/store';
+
+const {
   transactionStore,
   authSessionStore,
   browserSessionStore,
   userStore,
-  SESSION_COOKIE_NAME,
-} from '../_oidc-provider/store';
+} = oidcProviderOptions.storage ?? defaultProviderStores;
 
 /**
  * Login Server Action.
@@ -1096,7 +1320,7 @@ export async function loginAction(formData: FormData): Promise<void> {
   const transaction = await getAuthTransaction(transactionId, transactionStore);
   validateCsrfToken(transaction, csrfToken);
 
-  const user = userStore.authenticate(username, password);
+  const user = await userStore.authenticate(username, password);
   if (!user) {
     const failureResult = await handleLoginFailure(
       transactionId,
@@ -1123,7 +1347,7 @@ export async function loginAction(formData: FormData): Promise<void> {
   if (loginPromptValues.includes('login') || loginPromptValues.includes('select_account')) {
     await authSessionStore.delete(transactionId);
     const existingSessionId = cookieStore.get(SESSION_COOKIE_NAME)?.value;
-    if (existingSessionId) browserSessionStore.delete(existingSessionId);
+    if (existingSessionId) await browserSessionStore.delete(existingSessionId);
   }
 
   const authTime = Math.floor(Date.now() / 1000);
@@ -1139,7 +1363,7 @@ export async function loginAction(formData: FormData): Promise<void> {
   // Cookie attributes match buildSessionCookie() in store.ts so the
   // sessionResolver can read it back.
   const sessionId = await generateRandomString(32);
-  browserSessionStore.set(sessionId, { subject: user.sub, authTime });
+  await browserSessionStore.set(sessionId, { subject: user.sub, authTime });
   cookieStore.set(SESSION_COOKIE_NAME, sessionId, {
     httpOnly: true,
     secure: true,
@@ -1154,8 +1378,12 @@ export async function loginAction(formData: FormData): Promise<void> {
 
 export function nextJsConsentPageTemplate(corePkg: string): string {
   return `import { getAuthTransaction } from '${corePkg}';
-import { transactionStore } from '../_oidc-provider/store';
+import { oidcProviderOptions } from '../_oidc-provider/runtime';
+import { defaultProviderStores } from '../_oidc-provider/store';
 import { consentAction } from './actions';
+
+const transactionStore =
+  (oidcProviderOptions.storage ?? defaultProviderStores).transactionStore;
 
 export const dynamic = 'force-dynamic';
 
@@ -1223,13 +1451,13 @@ import {
   createAuthorizationCode,
 } from '${corePkg}';
 import { oidcProviderOptions } from '../_oidc-provider/runtime';
-import { consentResolver } from '../_oidc-provider/resolvers';
+import { createStoreResolvers } from '../_oidc-provider/resolvers';
 import type { RegisteredClient } from '../_oidc-provider/config';
-import {
-  transactionStore,
-  authCodeStore,
-  authSessionStore,
-} from '../_oidc-provider/store';
+import { defaultProviderStores } from '../_oidc-provider/store';
+
+const providerStores = oidcProviderOptions.storage ?? defaultProviderStores;
+const { transactionStore, authCodeStore, authSessionStore } = providerStores;
+const { consentResolver } = createStoreResolvers(providerStores);
 
 /**
  * Consent Server Action.
@@ -1431,7 +1659,7 @@ export function webConformanceTestTemplate(
 import type { SigningKeyProvider, SigningKey } from '${corePkg}';
 ${exportPublicJwkImport}import { createApp, validateSigningKeySet } from './app.js';
 import { createInMemoryClientResolver, type RegisteredClient } from './config.js';
-import { accessTokenStore, authSessionStore, consentStore, refreshTokenStore, transactionStore } from './store.js';
+import { accessTokenStore, authSessionStore, consentStore, createJsonProviderStores, refreshTokenStore, transactionStore, type JsonStoreBackend } from './store.js';
 import { consentResolver } from './resolvers.js';
 import { defaultViews } from './views.js';
 import { renderView } from './views.js';
@@ -1469,6 +1697,7 @@ ${requestObjectConformanceBeforeAll(features)}
 });
 
 describe('generated provider HTTP conformance', () => {
+${persistentStorageConformanceBlock()}
 ${nodeAdapterContract}
   describe('Generated view rendering', () => {
     it('should HTML-escape every login and consent value', () => {
@@ -1921,6 +2150,7 @@ export function nextJsGeneratedFiles(
   return [
     ...internalFiles,
     { path: '_oidc-provider/next.ts', content: nextJsRouteHandlerTemplate() },
+    { path: '_oidc-provider/storage-backend.ts', content: nextJsStorageBackendTemplate() },
     { path: '_oidc-provider/runtime.ts', content: nextJsRuntimeTemplate(corePkg) },
     {
       path: 'authorize/route.ts',

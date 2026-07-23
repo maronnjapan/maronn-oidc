@@ -92,6 +92,7 @@ describe('generate', () => {
         '_oidc-provider/routes/token.ts',
         '_oidc-provider/routes/userinfo.ts',
         '_oidc-provider/runtime.ts',
+        '_oidc-provider/storage-backend.ts',
         '_oidc-provider/store.ts',
         '_oidc-provider/views.ts',
         '_oidc-provider/web-router.ts',

@@ -5,7 +5,7 @@ description: Get up and running with Maronn OIDC in minutes.
 
 ## Prerequisites
 
-- Node.js 20+
+- Node.js 20+（Next.jsサンプルのローカルSQLite利用は22.13+）
 - pnpm（推奨）
 
 ## 1. CLI でコードを生成する
@@ -17,7 +17,7 @@ pnpm dlx @maronn-oidc/cli generate hono
 ```
 
 対応フレームワークは `hono` / `express` / `fastify` / `nextjs` です。
-既定では `./oidc-provider` に、エンドポイント実装・設定・インメモリストア・ログイン / 同意画面・契約テスト（`conformance.test.ts`）が生成されます。
+既定では `./oidc-provider` に、エンドポイント実装・設定・差し替え可能な`JsonStoreBackend`契約（未指定時はローカル検証用インメモリ実装）・ログイン / 同意画面・契約テスト（`conformance.test.ts`）が生成されます。Next.jsではVercel向けUpstash Redis RESTとローカルSQLiteのアダプターも生成されます。
 
 既存アプリに組み込む場合は `setup` コマンドが使えます（Next.js 以外）。エントリファイル内のプレースホルダーコメントを `applyOidc` の import と呼び出しに置換します。
 
@@ -51,7 +51,7 @@ applyOidc(app, {
 export default app;
 ```
 
-`signingKeyProvider` は `{ getSigningKey(): Promise<SigningKey> }` を実装するオブジェクトで、RS256 の秘密鍵・公開 JWK・kid を返します。実装例はリポジトリの `samples/hono/src/app.ts` を参照してください。
+`signingKeyProvider` は `{ getSigningKey(): Promise<SigningKey> }` を実装するオブジェクトで、RS256 の秘密鍵・公開 JWK・kid を返します。実装例はリポジトリの `samples/hono-cloudflare/src/app.ts` を参照してください。
 
 `config.ts` のデフォルト値（クライアント登録・issuer 等）はローカル検証専用です。実運用相当の検証では環境変数 / DB / KV から供給してください。
 

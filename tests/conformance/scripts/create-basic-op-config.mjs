@@ -56,12 +56,12 @@ const REQUEST_OBJECT_PRIVATE_JWKS = { keys: [REQUEST_OBJECT_PRIVATE_JWK] };
 
 const SAMPLE_APPS = new Map([
   [
-    'hono',
+    'hono-cloudflare',
     {
-      name: 'hono',
-      displayName: 'Hono',
-      packageName: '@maronn-oidc/sample-hono',
-      defaultStartCommand: 'node samples/hono/dist/server.js',
+      name: 'hono-cloudflare',
+      displayName: 'Hono Cloudflare',
+      packageName: '@maronn-oidc/sample-hono-cloudflare',
+      defaultStartCommand: 'corepack enable && pnpm --dir samples/hono-cloudflare start',
     },
   ],
   [
@@ -93,7 +93,7 @@ const SAMPLE_APPS = new Map([
   ],
 ]);
 
-export function resolveSampleApp(sampleApp = 'hono') {
+export function resolveSampleApp(sampleApp = 'hono-cloudflare') {
   const normalized = String(sampleApp).trim().toLowerCase();
   const metadata = SAMPLE_APPS.get(normalized);
   if (!metadata) {
@@ -113,7 +113,7 @@ export function createBasicOpConformanceArtifacts(options = {}) {
     options.suiteBaseUrl ?? DEFAULT_SUITE_BASE_URL,
     'suiteBaseUrl',
   );
-  const sampleApp = resolveSampleApp(options.sampleApp ?? 'hono');
+  const sampleApp = resolveSampleApp(options.sampleApp ?? 'hono-cloudflare');
   const redirectUris = createRedirectUris({ suiteBaseUrl, alias });
   // OIDC Core 1.0 §6.1 / RFC 9101: the suite signs Request Objects with the
   // private half of REQUEST_OBJECT_*_JWK; register the matching public JWKS on the

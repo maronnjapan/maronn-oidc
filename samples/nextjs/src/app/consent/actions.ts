@@ -8,13 +8,13 @@ import {
   createAuthorizationCode,
 } from '@maronn-oidc/core';
 import { oidcProviderOptions } from '../_oidc-provider/runtime';
-import { consentResolver } from '../_oidc-provider/resolvers';
+import { createStoreResolvers } from '../_oidc-provider/resolvers';
 import type { RegisteredClient } from '../_oidc-provider/config';
-import {
-  transactionStore,
-  authCodeStore,
-  authSessionStore,
-} from '../_oidc-provider/store';
+import { defaultProviderStores } from '../_oidc-provider/store';
+
+const providerStores = oidcProviderOptions.storage ?? defaultProviderStores;
+const { transactionStore, authCodeStore, authSessionStore } = providerStores;
+const { consentResolver } = createStoreResolvers(providerStores);
 
 /**
  * Consent Server Action.

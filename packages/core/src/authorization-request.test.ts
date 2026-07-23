@@ -2218,6 +2218,12 @@ describe('validateRegisteredRedirectUris', () => {
       expect(error).toBeUndefined();
     });
 
+    it('should accept any IPv4 loopback http:// redirect_uri', () => {
+      const error = captureError(['http://127.0.0.2:3000/cb']);
+
+      expect(error).toBeUndefined();
+    });
+
     it('should accept http://[::1] loopback redirect_uri', () => {
       const error = captureError(['http://[::1]:3000/cb']);
 

@@ -66,6 +66,38 @@ describe('HonoGenerator', () => {
     it('should generate 16 files total', () => {
       expect(files).toHaveLength(16);
     });
+
+    it('should generate an injectable persistent JSON storage contract', () => {
+      const store = files.find((f) => f.path === 'store.ts');
+      const resolvers = files.find((f) => f.path === 'resolvers.ts');
+      const apply = files.find((f) => f.path === 'apply.ts');
+
+      expect(store?.content).toContain('export interface JsonStoreBackend');
+      expect(store?.content).toContain('export interface ProviderStores');
+      expect(store?.content).toContain('export function createJsonProviderStores(');
+      expect(resolvers?.content).toContain('export function createStoreResolvers(');
+      expect(apply?.content).toContain('storage?: ProviderStores | ProviderStoresFactory;');
+      expect(apply?.content).toContain('const stores = await resolveProviderStores(options.storage, c);');
+      expect(apply?.content).toContain("c.set('authCodeStore', stores.authCodeStore)");
+    });
+
+    it('should await stores that can be backed by remote Cloudflare bindings', () => {
+      const login = files.find((f) => f.path === 'routes/login.ts');
+
+      expect(login?.content).toContain('await browserSessionStore.delete(existingSessionId)');
+      expect(login?.content).toContain('await browserSessionStore.set(sessionId, { subject: user.sub, authTime })');
+      expect(login?.content).toContain('await authenticateUser(username, password)');
+    });
+
+    it('should generate a conformance test for persistent storage injection', () => {
+      const conformance = files.find((f) => f.path === 'conformance.test.ts');
+
+      expect(conformance?.content).toContain("describe('Persistent storage contract'");
+      expect(conformance?.content).toContain('createJsonProviderStores');
+      expect(conformance?.content).toContain(
+        'should share state across provider store instances backed by the same backend',
+      );
+    });
   });
 
   // The generated provider lives under a CLI-owned directory, so its HTTP
@@ -1867,7 +1899,9 @@ describe('HonoGenerator browser session and SSO wiring (P1)', () => {
   describe('store.ts', () => {
     it('should define a BrowserSessionStore keyed by session_id', () => {
       expect(storeFile?.content).toContain('export class BrowserSessionStore');
-      expect(storeFile?.content).toContain('export const browserSessionStore = stores.browserSessionStore;');
+      expect(storeFile?.content).toContain(
+        'export const browserSessionStore = defaultProviderStores.browserSessionStore;',
+      );
     });
 
     // Next.js instantiates Server Components / Server Actions and Route Handlers
@@ -1876,8 +1910,12 @@ describe('HonoGenerator browser session and SSO wiring (P1)', () => {
     it('should back the singleton stores with globalThis so they are shared process-wide', () => {
       expect(storeFile?.content).toContain('__oidcProviderStores');
       expect(storeFile?.content).toContain('storeRegistry.__oidcProviderStores ??=');
-      expect(storeFile?.content).toContain('export const transactionStore = stores.transactionStore;');
-      expect(storeFile?.content).toContain('export const authCodeStore = stores.authCodeStore;');
+      expect(storeFile?.content).toContain(
+        'export const transactionStore = defaultProviderStores.transactionStore;',
+      );
+      expect(storeFile?.content).toContain(
+        'export const authCodeStore = defaultProviderStores.authCodeStore;',
+      );
     });
 
     it('should define the session cookie name and cookie helpers', () => {
@@ -1894,22 +1932,30 @@ describe('HonoGenerator browser session and SSO wiring (P1)', () => {
 
     it('should define a ConsentStore', () => {
       expect(storeFile?.content).toContain('export class ConsentStore');
-      expect(storeFile?.content).toContain('export const consentStore = stores.consentStore;');
+      expect(storeFile?.content).toContain(
+        'export const consentStore = defaultProviderStores.consentStore;',
+      );
     });
   });
 
   describe('resolvers.ts', () => {
     it('should export a default sessionResolver reading the session cookie', () => {
-      expect(resolversFile?.content).toContain('export const sessionResolver: SessionResolver');
+      expect(resolversFile?.content).toContain('const sessionResolver: SessionResolver');
       expect(resolversFile?.content).toContain('parseSessionId(request.headers.get');
       expect(resolversFile?.content).toContain('browserSessionStore.get');
+      expect(resolversFile?.content).toContain(
+        'export const sessionResolver = defaultStoreResolvers.sessionResolver;',
+      );
     });
 
     it('should export a default consentResolver backed by the consent store', () => {
       expect(resolversFile?.content).toContain(
-        'export const consentResolver: GrantAwareConsentResolver',
+        'const consentResolver: GrantAwareConsentResolver',
       );
       expect(resolversFile?.content).toContain('consentStore.hasConsent');
+      expect(resolversFile?.content).toContain(
+        'export const consentResolver = defaultStoreResolvers.consentResolver;',
+      );
     });
 
     // OIDC Core 1.0 Section 3.1.2.4: consent must be recorded so later
@@ -1967,10 +2013,10 @@ describe('HonoGenerator browser session and SSO wiring (P1)', () => {
   describe('apply.ts / app.ts wiring', () => {
     it('should wire default session and consent resolvers in apply.ts', () => {
       expect(applyFile?.content).toContain(
-        "c.set('sessionResolver', options.sessionResolver ?? defaultSessionResolver)",
+        "c.set('sessionResolver', options.sessionResolver ?? storeResolvers.sessionResolver)",
       );
       expect(applyFile?.content).toContain(
-        "c.set('consentResolver', options.consentResolver ?? defaultConsentResolver)",
+        "c.set('consentResolver', options.consentResolver ?? storeResolvers.consentResolver)",
       );
       expect(applyFile?.content).toContain('sessionResolver?: SessionResolver');
       expect(applyFile?.content).toContain('consentResolver?: ConsentResolver');
@@ -1978,10 +2024,10 @@ describe('HonoGenerator browser session and SSO wiring (P1)', () => {
 
     it('should wire default session and consent resolvers in app.ts', () => {
       expect(appFile?.content).toContain(
-        "c.set('sessionResolver', options.sessionResolver ?? defaultSessionResolver)",
+        "c.set('sessionResolver', options.sessionResolver ?? storeResolvers.sessionResolver)",
       );
       expect(appFile?.content).toContain(
-        "c.set('consentResolver', options.consentResolver ?? defaultConsentResolver)",
+        "c.set('consentResolver', options.consentResolver ?? storeResolvers.consentResolver)",
       );
     });
   });

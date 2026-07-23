@@ -21,13 +21,13 @@ describe('createBasicOpConformanceArtifacts', () => {
         alias: 'maronn-basic-op',
         opIssuer: 'https://op-tls:3443',
         suiteBaseUrl: 'https://conformance-nginx:8443',
-        sampleApp: 'hono',
+        sampleApp: 'hono-cloudflare',
       });
 
       assert.equal(BASIC_OP_TEST_PLAN, 'oidcc-basic-certification-test-plan[server_metadata=discovery][client_registration=static_client]');
       assert.deepEqual(artifacts.config, {
         alias: 'maronn-basic-op',
-        description: 'maronn-oidc Basic OP certification check for the Hono sample',
+        description: 'maronn-oidc Basic OP certification check for the Hono Cloudflare sample',
         server: {
           discoveryUrl: 'https://op-tls:3443/.well-known/openid-configuration',
         },
@@ -160,7 +160,7 @@ describe('createBasicOpConformanceArtifacts', () => {
         alias: 'maronn-basic-op',
         opIssuer: 'https://op-tls:3443',
         suiteBaseUrl: 'https://conformance-nginx:8443',
-        sampleApp: 'hono',
+        sampleApp: 'hono-cloudflare',
         clientJwks,
       });
 
@@ -177,7 +177,7 @@ describe('createBasicOpConformanceArtifacts', () => {
         alias: 'maronn-basic-op',
         opIssuer: 'https://op-tls:3443',
         suiteBaseUrl: 'https://conformance-nginx:8443',
-        sampleApp: 'hono',
+        sampleApp: 'hono-cloudflare',
       });
 
       // OP side trusts only the public half (no private material must leak here).
@@ -254,7 +254,7 @@ describe('resolveSampleApp', () => {
       assert.throws(
         () => resolveSampleApp('not-a-sample'),
         {
-          message: 'Unsupported CONFORMANCE_SAMPLE_APP "not-a-sample". Expected one of: hono, express, fastify, nextjs',
+          message: 'Unsupported CONFORMANCE_SAMPLE_APP "not-a-sample". Expected one of: hono-cloudflare, express, fastify, nextjs',
         },
       );
     });

@@ -3,7 +3,7 @@ import type { SigningKeyProvider, SigningKey } from '@maronn-oidc/core';
 import { exportPublicJwk } from '@maronn-oidc/core';
 import { createApp, validateSigningKeySet } from './app';
 import { createInMemoryClientResolver, type RegisteredClient } from './config';
-import { accessTokenStore, authSessionStore, consentStore, refreshTokenStore, transactionStore } from './store';
+import { accessTokenStore, authSessionStore, consentStore, createJsonProviderStores, refreshTokenStore, transactionStore, type JsonStoreBackend } from './store';
 import { consentResolver } from './resolvers';
 import { defaultViews } from './views';
 import { renderView } from './views';
@@ -122,6 +122,41 @@ beforeAll(async () => {
 });
 
 describe('generated provider HTTP conformance', () => {
+  describe('Persistent storage contract', () => {
+    it('should share state across provider store instances backed by the same backend', async () => {
+      const values = new Map<string, unknown>();
+      const backend: JsonStoreBackend = {
+        async get<T>(key: string): Promise<T | null> {
+          return (values.get(key) as T | undefined) ?? null;
+        },
+        async put<T>(key: string, value: T): Promise<void> {
+          values.set(key, value);
+        },
+        async delete(key: string): Promise<void> {
+          values.delete(key);
+        },
+        async list<T>(prefix: string): Promise<Array<{ key: string; value: T }>> {
+          return [...values.entries()]
+            .filter(([key]) => key.startsWith(prefix))
+            .map(([key, value]) => ({ key, value: value as T }));
+        },
+      };
+      const writerStores = createJsonProviderStores(backend);
+      await writerStores.authSessionStore.set('persistent-transaction', {
+        subject: 'testuser',
+        authTime: 1700000000,
+      });
+
+      const readerStores = createJsonProviderStores(backend);
+
+      expect(await readerStores.authSessionStore.get('persistent-transaction')).toEqual({
+        subject: 'testuser',
+        authTime: 1700000000,
+      });
+    });
+  });
+
+
 
   describe('Generated view rendering', () => {
     it('should HTML-escape every login and consent value', () => {

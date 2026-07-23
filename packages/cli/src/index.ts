@@ -177,16 +177,18 @@ export function run(args: string[]): void {
       patchEntryFile(parsed.entryFile, parsed.outputDir);
       console.log(`\nNext steps:`);
       console.log(`  1. Provide runtime config, signing keys, and client resolvers from env/DB/KV`);
-      console.log(`  2. Use ${parsed.outputDir}/config.ts defaults only for quick local testing`);
-      console.log(`  3. Start the server\n`);
+      console.log(`  2. Inject persistent ProviderStores through the generated JsonStoreBackend contract`);
+      console.log(`  3. Use ${parsed.outputDir}/config.ts defaults only for quick local testing`);
+      console.log(`  4. Start the server\n`);
     } else {
       const installCommand =
         INSTALL_COMMANDS[result.framework] ?? `pnpm add @maronn-oidc/core`;
       console.log(`\nNext steps:`);
       console.log(`  1. Provide runtime config, signing keys, and client resolvers from env/DB/KV`);
-      console.log(`  2. Use config.ts defaults only for quick local testing`);
-      console.log(`  3. Install dependencies: ${installCommand}`);
-      console.log(`  4. Start the server\n`);
+      console.log(`  2. Inject persistent ProviderStores through the generated JsonStoreBackend contract`);
+      console.log(`  3. Use config.ts defaults only for quick local testing`);
+      console.log(`  4. Install dependencies: ${installCommand}`);
+      console.log(`  5. Start the server\n`);
     }
   } catch (error) {
     if (error instanceof Error) {

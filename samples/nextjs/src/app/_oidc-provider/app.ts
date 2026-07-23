@@ -14,9 +14,12 @@ import {
   type ProviderConfig,
 } from './config';
 import {
-  sessionResolver as defaultSessionResolver,
-  consentResolver as defaultConsentResolver,
+  createStoreResolvers,
 } from './resolvers';
+import {
+  defaultProviderStores,
+  type ProviderStores,
+} from './store';
 import { createViews, type Views } from './views';
 import {
   assertHasRs256Key,
@@ -47,6 +50,8 @@ export interface OidcProviderOptions {
   tokenClientResolver?: TokenClientResolver;
   sessionResolver?: SessionResolver;
   consentResolver?: ConsentResolver;
+  /** Persistent stores shared by Route Handlers and Server Actions. */
+  storage?: ProviderStores;
   acrResolver?: AcrResolver;
   jwksProvider?: () => Promise<JwkSet> | JwkSet;
   corsOrigins?: CorsOrigins;
@@ -118,6 +123,8 @@ export function createApp(options: OidcProviderOptions): WebRouter {
     const { privateKey, publicJwk, keyId } = signingKey;
     const clientResolver =
       options.clientResolver ?? createInMemoryClientResolver();
+    const stores = options.storage ?? defaultProviderStores;
+    const storeResolvers = createStoreResolvers(stores);
 
     c.set('privateKey', privateKey);
     c.set('publicJwk', publicJwk);
@@ -134,6 +141,22 @@ export function createApp(options: OidcProviderOptions): WebRouter {
     c.set('config', createProviderConfig(options.config));
     c.set('clientResolver', clientResolver);
     c.set('tokenClientResolver', options.tokenClientResolver ?? clientResolver);
+    c.set('transactionStore', stores.transactionStore);
+    c.set('authCodeStore', stores.authCodeStore);
+    c.set('accessTokenStore', stores.accessTokenStore);
+    c.set('refreshTokenStore', stores.refreshTokenStore);
+    c.set('authSessionStore', stores.authSessionStore);
+    c.set('browserSessionStore', stores.browserSessionStore);
+    c.set('authenticateUser', (username: string, password: string) =>
+      stores.userStore.authenticate(username, password));
+    c.set('authCodeResolver', storeResolvers.authorizationCodeResolver);
+    c.set('accessTokenResolver', storeResolvers.accessTokenResolver);
+    c.set('userClaimsResolver', storeResolvers.userClaimsResolver);
+    c.set('refreshTokenResolver', storeResolvers.refreshTokenResolver);
+    c.set('introspectionAccessTokenResolver', storeResolvers.introspectionAccessTokenResolver);
+    c.set('introspectionRefreshTokenResolver', storeResolvers.introspectionRefreshTokenResolver);
+    c.set('revocationResolvers', storeResolvers.revocationResolvers);
+
     if (options.acrResolver) {
       c.set('acrResolver', options.acrResolver);
     }
@@ -141,8 +164,8 @@ export function createApp(options: OidcProviderOptions): WebRouter {
     // 署名鍵セットを既定として使い、OP が発行した ID Token を hint として検証できる
     // ようにする（OIDC Core 1.0 §3.1.2.2）。明示指定があれば優先。
     c.set('jwksProvider', options.jwksProvider ?? (() => signingKeysToJwkSet(idTokenSigningKeys)));
-    c.set('sessionResolver', options.sessionResolver ?? defaultSessionResolver);
-    c.set('consentResolver', options.consentResolver ?? defaultConsentResolver);
+    c.set('sessionResolver', options.sessionResolver ?? storeResolvers.sessionResolver);
+    c.set('consentResolver', options.consentResolver ?? storeResolvers.consentResolver);
     // Inject custom UI (login / consent / error) merged over the defaults.
     c.set('views', createViews(options.views));
     await next();

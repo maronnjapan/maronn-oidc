@@ -16,16 +16,16 @@ import type {
   SessionInfo,
   ConsentResolver,
 } from '@maronn-oidc/core';
-import { createInMemoryClientResolver } from './config';
+import { createInMemoryClientResolver } from './config.js';
 import {
   defaultProviderStores,
   parseSessionId,
   type ProviderStores,
-} from './store';
+} from './store.js';
 
 /**
  * Default in-memory client resolver for quick local testing.
- * Project integrations should inject a D1/KV/env-backed resolver through the generated request context.
+ * Project integrations should inject a D1/KV/env-backed resolver through Hono context.
  */
 export const clientResolver: ClientResolver & TokenClientResolver =
   createInMemoryClientResolver();

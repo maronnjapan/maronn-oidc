@@ -1,4 +1,4 @@
-import { Hono } from 'hono';
+import type { Hono } from 'hono';
 import { cors } from 'hono/cors';
 import { authorizeApp } from './routes/authorize.js';
 import { tokenApp } from './routes/token.js';
@@ -15,9 +15,13 @@ import {
   type ProviderConfig,
 } from './config.js';
 import {
-  sessionResolver as defaultSessionResolver,
-  consentResolver as defaultConsentResolver,
+  createStoreResolvers,
 } from './resolvers.js';
+import {
+  defaultProviderStores,
+  type ProviderStores,
+  type ProviderStoresFactory,
+} from './store.js';
 import { createViews, type Views } from './views.js';
 import {
   assertHasRs256Key,
@@ -32,24 +36,41 @@ import type {
   ClientResolver,
   TokenClientResolver,
   AcrResolver,
+  JwkSet,
   SessionResolver,
   ConsentResolver,
-  JwkSet,
 } from '@maronn-oidc/core';
 
+/**
+ * CORS の許可 origin。
+ * - '*' (デフォルト) または string / string[]: cors() の origin オプションに直接渡される
+ * - browser-based クライアントで Authorization ヘッダや form body を使う場合は許可必須 (OAuth 2.1 §4.2)
+ */
 export type CorsOrigins = string | string[];
 
-export interface CreateAppOptions {
+export interface ApplyOidcOptions {
   config?: Partial<ProviderConfig>;
   /**
-   * Provider for the RSA signing key pair.
-   * Must load keys from your secret store (env var, KV, D1, etc.).
+   * Primary signing key provider. Used for the access token (JWT format) and
+   * as the fallback for ID Token / UserInfo signing when their dedicated
+   * providers are not configured. Must load keys from your secret store
+   * (env var, KV, D1, etc.).
    * Use createCachedSigningKeyProvider() to refresh the key periodically.
-   * Note: JWKS serves only the current key. Tokens signed with a rotated-out
-   * key will fail verification after the provider returns a new key.
    */
   signingKeyProvider: SigningKeyProvider;
+  /**
+   * Optional ID Token signing key provider.
+   * If omitted, signingKeyProvider is used.
+   * Useful when id_token_signed_response_alg differs from the access token
+   * algorithm, or when you want to rotate ID Token keys independently.
+   */
   idTokenSigningKeyProvider?: SigningKeyProvider;
+  /**
+   * Optional UserInfo JWT signing key provider.
+   * If omitted, signingKeyProvider is used.
+   * Useful when userinfo_signed_response_alg differs from other signing keys
+   * (OIDC Core 1.0 Section 5.3.2).
+   */
   userinfoSigningKeyProvider?: SigningKeyProvider;
   clientResolver?: ClientResolver;
   tokenClientResolver?: TokenClientResolver;
@@ -65,21 +86,37 @@ export interface CreateAppOptions {
    * Defaults to the in-memory consent store resolver in resolvers.ts.
    */
   consentResolver?: ConsentResolver;
+  /** Persistent stores, or a request-aware factory for bindings such as Cloudflare D1. */
+  storage?: ProviderStores | ProviderStoresFactory;
+  /**
+   * acr / amr resolver (OIDC Core 1.0 §2 / §12.1).
+   * Host application が認証ポリシーに合わせて acr / amr を返す。
+   * 未指定の場合 ID Token に acr / amr クレームは含まれない（T-009 hold 相当）。
+   */
   acrResolver?: AcrResolver;
+  /**
+   * id_token_hint 検証用に OP の JWKS を返すプロバイダ。
+   * authorize エンドポイントで id_token_hint パラメータを受け取った場合、
+   * その JWT の署名を検証するために使用される (OIDC Core 1.0 §3.1.2.1)。
+   * 未指定の場合、id_token_hint を含む prompt=none 認可リクエストは
+   * login_required で拒否される。
+   */
+  jwksProvider?: () => Promise<JwkSet> | JwkSet;
+  /**
+   * CORS で許可する origin。
+   * - 未指定: '*' (=ワイルドカード)
+   * - 文字列または配列: そのまま hono/cors の origin に渡す
+   *
+   * Token / UserInfo / Introspection / Revocation エンドポイントに適用される。
+   * Discovery / JWKS は仕様上常に '*' 固定 (OIDC Discovery / RFC 8414 で公開資産扱い)。
+   */
+  corsOrigins?: CorsOrigins;
   /**
    * Custom UI for the login / consent / error pages.
    * Provide any subset; omitted pages fall back to the default views.
    * Inject your own UI here instead of editing views.ts.
    */
   views?: Partial<Views>;
-  /**
-   * JWKS provider used to verify id_token_hint (OIDC Core 1.0 §3.1.2.2).
-   * Omit to use the OP's own ID Token signing keys by default, so an ID Token
-   * the OP issued can be presented back as id_token_hint without extra wiring.
-   * Override only when hints are signed by a different key set.
-   */
-  jwksProvider?: () => Promise<JwkSet> | JwkSet;
-  corsOrigins?: CorsOrigins;
 }
 
 export function validateSigningKeySet(
@@ -117,14 +154,22 @@ async function enforceOidcEndpointMethod(c: any, next: () => Promise<void>): Pro
 
 
 /**
- * Initialize the OpenID Connect Provider.
- * Mounts middleware and routes onto the app instance.
+ * Apply the OpenID Connect Provider routes and middleware to an existing Hono app.
+ * Call this function to add OIDC provider functionality to your application.
+ *
+ * @example
+ * import { Hono } from 'hono';
+ * import { applyOidc } from './oidc-provider/apply.js';
+ *
+ * const app = new Hono();
+ * app.get('/', (c) => c.text('Hello World'));
+ * applyOidc(app, { signingKeyProvider: yourProvider });
  */
-export function createApp(options: CreateAppOptions): Hono<{ Variables: Record<string, any> }> {
-  // A factory must return an isolated router each time. Keeping this instance at
-  // module scope makes later createApp calls reuse a matcher whose routes were
-  // already finalized and also leaks the first call's middleware/options.
-  const app = new Hono<{ Variables: Record<string, any> }>();
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export function applyOidc(app: Hono<any>, options: ApplyOidcOptions): void {
+  // CORS middleware (OAuth 2.1 §4.2): browser-based client が Token/UserInfo/Introspect/Revoke
+  // を呼べるように Access-Control-Allow-Origin を返す。preflight (OPTIONS) も自動で処理される。
+  // Discovery / JWKS は常に '*' (公開資産)。
   const corsOrigins = options.corsOrigins ?? '*';
   const protectedCors = cors({
     origin: corsOrigins,
@@ -132,7 +177,11 @@ export function createApp(options: CreateAppOptions): Hono<{ Variables: Record<s
     allowHeaders: ['Authorization', 'Content-Type'],
     maxAge: 600,
   });
-  const publicCors = cors({ origin: '*', allowMethods: ['GET', 'OPTIONS'], maxAge: 600 });
+  const publicCors = cors({
+    origin: '*',
+    allowMethods: ['GET', 'OPTIONS'],
+    maxAge: 600,
+  });
   app.use('/token', protectedCors);
   app.use('/userinfo', protectedCors);
   app.use('/introspect', protectedCors);
@@ -142,19 +191,22 @@ export function createApp(options: CreateAppOptions): Hono<{ Variables: Record<s
   // CORS must run first so OPTIONS preflights are answered before method enforcement.
   app.use('*', enforceOidcEndpointMethod);
 
-  // Store runtime dependencies for use by routes.
+  // Store runtime dependencies for use by route handlers.
   app.use('*', async (c, next) => {
     let signingKey;
     let idTokenSigningKey;
     let userinfoSigningKey;
+    // T-022: registered key sets (current + rotated-out + alg variants).
+    // Each provider's getSigningKeys() drives JWKS / Discovery; getSigningKey()
+    // drives "the active key for new signatures." A provider that does not
+    // implement getSigningKeys gets a single-element fallback automatically.
     let signingKeys;
     let idTokenSigningKeys;
     let userinfoSigningKeys;
     try {
       signingKey = await options.signingKeyProvider.getSigningKey();
-      // T-022: surface every registered key so JWKS/Discovery can advertise
-      // rotated-out and alternate-alg keys, not just the active signing key.
       signingKeys = await getRegisteredSigningKeys(options.signingKeyProvider);
+      // Each purpose-specific provider falls back to the primary signing key.
       const idProvider = options.idTokenSigningKeyProvider ?? options.signingKeyProvider;
       idTokenSigningKey = await idProvider.getSigningKey();
       idTokenSigningKeys = await getRegisteredSigningKeys(idProvider);
@@ -170,36 +222,59 @@ export function createApp(options: CreateAppOptions): Hono<{ Variables: Record<s
     const { privateKey, publicJwk, keyId } = signingKey;
     const clientResolver =
       options.clientResolver ?? createInMemoryClientResolver();
+    const stores = await resolveProviderStores(options.storage, c);
+    const storeResolvers = createStoreResolvers(stores);
 
+    // Backward-compatible aliases (primary key) — used by jwks/token routes that
+    // still read these context vars.
     c.set('privateKey', privateKey);
     c.set('publicJwk', publicJwk);
     c.set('keyId', keyId);
-    c.set('signingKeys', signingKeys);
+    // Purpose-specific active keys
     c.set('idTokenPrivateKey', idTokenSigningKey.privateKey);
     c.set('idTokenPublicJwk', idTokenSigningKey.publicJwk);
     c.set('idTokenKeyId', idTokenSigningKey.keyId);
     c.set('userinfoPrivateKey', userinfoSigningKey.privateKey);
     c.set('userinfoPublicJwk', userinfoSigningKey.publicJwk);
     c.set('userinfoKeyId', userinfoSigningKey.keyId);
+    // T-022: registered key sets per purpose.
+    c.set('signingKeys', signingKeys);
     c.set('idTokenSigningKeys', idTokenSigningKeys);
     c.set('userinfoSigningKeys', userinfoSigningKeys);
+
     c.set('config', createProviderConfig(options.config));
     c.set('clientResolver', clientResolver);
     c.set('tokenClientResolver', options.tokenClientResolver ?? clientResolver);
-    // P1: default cookie-based session + consent resolvers so prompt=none /
-    // max_age / SSO work out of the box (OIDC Core 1.0 Section 3.1.2.1 / 3.1.2.3).
-    c.set('sessionResolver', options.sessionResolver ?? defaultSessionResolver);
-    c.set('consentResolver', options.consentResolver ?? defaultConsentResolver);
+    c.set('transactionStore', stores.transactionStore);
+    c.set('authCodeStore', stores.authCodeStore);
+    c.set('accessTokenStore', stores.accessTokenStore);
+    c.set('refreshTokenStore', stores.refreshTokenStore);
+    c.set('authSessionStore', stores.authSessionStore);
+    c.set('browserSessionStore', stores.browserSessionStore);
+    c.set('authenticateUser', (username: string, password: string) =>
+      stores.userStore.authenticate(username, password));
+    c.set('authCodeResolver', storeResolvers.authorizationCodeResolver);
+    c.set('accessTokenResolver', storeResolvers.accessTokenResolver);
+    c.set('userClaimsResolver', storeResolvers.userClaimsResolver);
+    c.set('refreshTokenResolver', storeResolvers.refreshTokenResolver);
+    c.set('introspectionAccessTokenResolver', storeResolvers.introspectionAccessTokenResolver);
+    c.set('introspectionRefreshTokenResolver', storeResolvers.introspectionRefreshTokenResolver);
+    c.set('revocationResolvers', storeResolvers.revocationResolvers);
+
+    // T-015: acr / amr resolver (optional; undefined preserves T-009 hold behavior).
     if (options.acrResolver) {
       c.set('acrResolver', options.acrResolver);
     }
+    // T-017 / P1: id_token_hint 検証用 JWKS プロバイダ。未指定なら OP 自身の
+    // ID Token 署名鍵セットを既定として使い、OP が発行した ID Token を hint として
+    // 検証できるようにする（OIDC Core 1.0 §3.1.2.2）。明示指定があれば優先。
+    c.set('jwksProvider', options.jwksProvider ?? (() => signingKeysToJwkSet(idTokenSigningKeys)));
+    // P1: default cookie-based session + consent resolvers so prompt=none /
+    // max_age / SSO work out of the box (OIDC Core 1.0 Section 3.1.2.1 / 3.1.2.3).
+    c.set('sessionResolver', options.sessionResolver ?? storeResolvers.sessionResolver);
+    c.set('consentResolver', options.consentResolver ?? storeResolvers.consentResolver);
     // Inject custom UI (login / consent / error) merged over the defaults.
     c.set('views', createViews(options.views));
-    // Default jwksProvider verifies id_token_hint against the OP's own ID Token
-    // signing keys (OIDC Core 1.0 §3.1.2.2) so a hint the OP issued validates out
-    // of the box. An explicit options.jwksProvider overrides it. The closure
-    // captures this request's key set so it reflects the latest rotation.
-    c.set('jwksProvider', options.jwksProvider ?? (() => signingKeysToJwkSet(idTokenSigningKeys)));
     await next();
   });
 
@@ -212,6 +287,12 @@ export function createApp(options: CreateAppOptions): Hono<{ Variables: Record<s
   app.route('/.well-known/openid-configuration', discoveryApp);
   app.route('/login', loginApp);
   app.route('/consent', consentApp);
+}
 
-  return app;
+async function resolveProviderStores(
+  storage: ApplyOidcOptions['storage'],
+  context: any,
+): Promise<ProviderStores> {
+  if (!storage) return defaultProviderStores;
+  return typeof storage === 'function' ? storage(context) : storage;
 }
